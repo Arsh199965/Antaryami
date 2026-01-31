@@ -1,5 +1,6 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import { useVoiceBot } from "@/hooks/useVoiceBot"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -12,6 +13,7 @@ import {
 } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Mic, MicOff, PhoneOff } from "lucide-react"
 
@@ -21,7 +23,7 @@ function formatDuration(seconds: number) {
   return `${m}:${s.toString().padStart(2, "0")}`
 }
 
-export default function Home() {
+function VoiceContent() {
   const {
     callState,
     audioLevel,
@@ -170,4 +172,51 @@ export default function Home() {
       </main>
     </div>
   )
+}
+
+function PageSkeleton() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-zinc-950">
+      <main className="w-full max-w-2xl px-4 py-8">
+        <Card className="overflow-hidden">
+          <CardHeader className="flex flex-row items-center justify-between gap-4 space-y-0 border-b pb-4">
+            <div>
+              <Skeleton className="mb-1 h-6 w-32" />
+              <Skeleton className="h-4 w-56" />
+            </div>
+            <Skeleton className="h-6 w-16 rounded-full" />
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6 pt-6">
+            <div className="flex justify-center">
+              <Skeleton className="size-10 rounded-full" />
+            </div>
+            <div className="grid gap-4">
+              <div className="space-y-2">
+                <Skeleton className="h-4 w-16" />
+                <Skeleton className="h-24 w-full rounded-md" />
+              </div>
+              <div className="space-y-2">
+                <Skeleton className="h-4 w-20" />
+                <Skeleton className="h-32 w-full rounded-md" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </main>
+    </div>
+  )
+}
+
+export default function Home() {
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  if (!mounted) {
+    return <PageSkeleton />
+  }
+
+  return <VoiceContent />
 }
