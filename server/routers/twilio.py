@@ -16,7 +16,11 @@ from modules.config import ConfigEnv
 from services.stt import STTService, VADService
 from services.llm import LLMService
 from services.tts import TTSService
-from utils.rnnoise_utils import RealtimeRNNoiseDenoiser
+
+try:
+    from utils.rnnoise_utils import RealtimeRNNoiseDenoiser
+except Exception:
+    RealtimeRNNoiseDenoiser = None  # pyrnnoise/DLL missing; denoising disabled
 
 # =========================
 # Router Setup
@@ -128,7 +132,13 @@ async def media_stream(ws: WebSocket):
     vad_service = VADService()
     llm_service = LLMService()
     tts_service = TTSService()
-    denoiser = RealtimeRNNoiseDenoiser() if ConfigEnv.STT_DENOISE_ENABLED else None
+    denoiser = None
+    if ConfigEnv.STT_DENOISE_ENABLED and RealtimeRNNoiseDenoiser is not None:
+        try:
+            denoiser = RealtimeRNNoiseDenoiser()
+        except Exception as e:
+            logger.warning("STT denoiser disabled for this connection: %s", e)
+            denoiser = None
 
     async def finalize_utterance():
         """Finalize accumulated utterance and trigger LLM processing"""
@@ -350,10 +360,14 @@ async def media_stream(ws: WebSocket):
                         None
                     )
                     
-                    # Optional real-time denoising, then stream to Soniox and VAD
+                    # Optional real-time denoising, then stream to Soniox and VAD (fail-open: on error use raw)
                     if denoiser:
-                        denoised = await asyncio.to_thread(denoiser.process, resampled)
-                        audio_for_stt_vad = denoised
+                        try:
+                            denoised = await asyncio.to_thread(denoiser.process, resampled)
+                            audio_for_stt_vad = denoised if denoised else resampled
+                        except Exception as e:
+                            logger.warning("Denoiser process failed, using raw audio: %s", e)
+                            audio_for_stt_vad = resampled
                     else:
                         audio_for_stt_vad = resampled
                     
@@ -435,7 +449,7 @@ async def media_stream(ws: WebSocket):
                 if remaining:
                     await asyncio.to_thread(stt_service.stream, remaining)
             except Exception as e:
-                logger.warning(f"⚠️ Denoiser flush error: {e}")
+                logger.warning("Denoiser flush failed: %s", e)
         try:
             await asyncio.to_thread(stt_service.disconnect)
             logger.info("🔌 Disconnected from Soniox")
