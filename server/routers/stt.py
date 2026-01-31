@@ -18,6 +18,7 @@ from services.llm import LLMService
 from services.tts import TTSService
 from modules.config import ConfigEnv
 from modules.response.tool_registry import get_registry
+from utils.rnnoise_utils import RealtimeRNNoiseDenoiser
 
 TTSLanguage = Literal["hi", "en", "auto"]
 
@@ -158,7 +159,8 @@ async def audio_websocket(ws: WebSocket):
     vad_service = VADService()
     llm_service = LLMService()
     tts_service = TTSService()
-    
+    denoiser = RealtimeRNNoiseDenoiser() if ConfigEnv.STT_DENOISE_ENABLED else None
+
     async def finalize_utterance():
         """Finalize accumulated utterance and trigger LLM processing"""
         nonlocal current_utterance_parts, tts_task
@@ -410,9 +412,14 @@ async def audio_websocket(ws: WebSocket):
             # Receive audio chunk
             audio_bytes = await ws.receive_bytes()
 
-            # Stream to Soniox immediately
+            # Optional real-time denoising, then stream to Soniox
             try:
-                await asyncio.to_thread(stt_service.stream, audio_bytes)
+                if denoiser:
+                    denoised = await asyncio.to_thread(denoiser.process, audio_bytes)
+                    if denoised:
+                        await asyncio.to_thread(stt_service.stream, denoised)
+                else:
+                    await asyncio.to_thread(stt_service.stream, audio_bytes)
             except Exception as e:
                 print(f"⚠️  STT streaming error: {e}")
                 # Continue processing, don't crash on STT errors
@@ -428,7 +435,14 @@ async def audio_websocket(ws: WebSocket):
         if tts_task and not tts_task.done():
             tts_task.cancel()
     finally:
-        # Cleanup
+        # Flush denoiser buffer and stream remaining audio, then disconnect
+        if denoiser:
+            try:
+                remaining = await asyncio.to_thread(denoiser.flush)
+                if remaining:
+                    await asyncio.to_thread(stt_service.stream, remaining)
+            except Exception as e:
+                print(f"⚠️  Denoiser flush error: {e}")
         try:
             await asyncio.to_thread(stt_service.disconnect)
             print("🔌 Disconnected from Soniox")

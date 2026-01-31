@@ -16,6 +16,7 @@ from modules.config import ConfigEnv
 from services.stt import STTService, VADService
 from services.llm import LLMService
 from services.tts import TTSService
+from utils.rnnoise_utils import RealtimeRNNoiseDenoiser
 
 # =========================
 # Router Setup
@@ -127,7 +128,8 @@ async def media_stream(ws: WebSocket):
     vad_service = VADService()
     llm_service = LLMService()
     tts_service = TTSService()
-    
+    denoiser = RealtimeRNNoiseDenoiser() if ConfigEnv.STT_DENOISE_ENABLED else None
+
     async def finalize_utterance():
         """Finalize accumulated utterance and trigger LLM processing"""
         nonlocal current_utterance_parts, tts_task
@@ -348,14 +350,21 @@ async def media_stream(ws: WebSocket):
                         None
                     )
                     
-                    # Stream to Soniox
+                    # Optional real-time denoising, then stream to Soniox and VAD
+                    if denoiser:
+                        denoised = await asyncio.to_thread(denoiser.process, resampled)
+                        audio_for_stt_vad = denoised
+                    else:
+                        audio_for_stt_vad = resampled
+                    
                     try:
-                        await asyncio.to_thread(stt_service.stream, resampled)
+                        if audio_for_stt_vad:
+                            await asyncio.to_thread(stt_service.stream, audio_for_stt_vad)
                     except Exception as e:
                         logger.error(f"⚠️ STT streaming error: {e}")
                     
-                    # VAD processing
-                    vad_buffer += resampled
+                    # VAD processing (on denoised audio when enabled)
+                    vad_buffer += audio_for_stt_vad
                     while len(vad_buffer) >= VAD_MIN_BYTES:
                         chunk = vad_buffer[:VAD_MIN_BYTES]
                         vad_buffer = vad_buffer[VAD_MIN_BYTES:]
@@ -419,7 +428,14 @@ async def media_stream(ws: WebSocket):
         if tts_task and not tts_task.done():
             tts_task.cancel()
     finally:
-        # Cleanup
+        # Flush denoiser buffer and stream remaining audio, then disconnect
+        if denoiser:
+            try:
+                remaining = await asyncio.to_thread(denoiser.flush)
+                if remaining:
+                    await asyncio.to_thread(stt_service.stream, remaining)
+            except Exception as e:
+                logger.warning(f"⚠️ Denoiser flush error: {e}")
         try:
             await asyncio.to_thread(stt_service.disconnect)
             logger.info("🔌 Disconnected from Soniox")

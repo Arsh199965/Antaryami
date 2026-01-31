@@ -65,6 +65,7 @@ class ConfigEnv:
     # ----- STT -----
     SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
     ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
+    STT_DENOISE_ENABLED = convert_to_bool(os.getenv("STT_DENOISE_ENABLED", "true")) is not False
 
     # ----- Feature flags -----
     _ide = (os.getenv("INTENT_DETECTION_ENABLED", "true") or "").strip().lower()
