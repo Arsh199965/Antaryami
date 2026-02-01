@@ -64,6 +64,8 @@ class PendingHandoff:
     requested_at: datetime
     conversation_history: List[Dict[str, str]]
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    is_twilio: bool = False  # Track if this is a Twilio phone call
+    stream_sid: Optional[str] = None  # Twilio stream SID for sending audio
 
 
 @dataclass
@@ -76,6 +78,8 @@ class ActiveCall:
     agent_ws: WebSocket
     started_at: datetime
     conversation_history: List[Dict[str, str]]
+    is_twilio: bool = False  # Track if this is a Twilio phone call
+    stream_sid: Optional[str] = None  # Twilio stream SID for sending audio
 
 
 class HandoffManager:
@@ -92,7 +96,9 @@ class HandoffManager:
         user_id: str,
         user_ws: WebSocket,
         reason: str,
-        conversation_history: List[Dict[str, str]]
+        conversation_history: List[Dict[str, str]],
+        is_twilio: bool = False,
+        stream_sid: Optional[str] = None
     ) -> str:
         """Add a user to the handoff queue."""
         async with self._lock:
@@ -102,6 +108,8 @@ class HandoffManager:
                 reason=reason,
                 requested_at=datetime.now(timezone.utc),
                 conversation_history=conversation_history,
+                is_twilio=is_twilio,
+                stream_sid=stream_sid
             )
             self.pending_handoffs[handoff.session_id] = handoff
             logger.info(f"[Handoff] User {user_id} added to queue (session: {handoff.session_id})")
@@ -166,6 +174,8 @@ class HandoffManager:
                 agent_ws=agent_ws,
                 started_at=datetime.now(timezone.utc),
                 conversation_history=handoff.conversation_history,
+                is_twilio=handoff.is_twilio,
+                stream_sid=handoff.stream_sid
             )
             self.active_calls[session_id] = active_call
             
@@ -246,7 +256,8 @@ class HandoffManager:
     async def relay_audio_to_agent(self, session_id: str, audio_bytes: bytes):
         """Relay audio from user to agent.
         
-        User sends PCM16 at 16kHz. Agent receives as Float32 at 44100Hz for playback.
+        User sends PCM16 at 16kHz.
+        Agent expects Float32 at 44100Hz for web audio playback.
         """
         if session_id in self.active_calls:
             call = self.active_calls[session_id]
@@ -255,6 +266,7 @@ class HandoffManager:
                 float_audio = pcm16_to_float32(audio_bytes)
                 # Upsample from 16kHz to 44100Hz
                 upsampled = upsample_audio(float_audio, 16000, 44100)
+                # Send to agent
                 await call.agent_ws.send_bytes(upsampled)
             except Exception as e:
                 logger.error(f"[Handoff] Failed to relay audio to agent: {e}")
@@ -262,16 +274,49 @@ class HandoffManager:
     async def relay_audio_to_user(self, session_id: str, audio_bytes: bytes):
         """Relay audio from agent to user.
         
-        Agent sends PCM16 at 16kHz. User receives as Float32 at 44100Hz for playback.
+        Agent sends PCM16 at 16kHz.
+        - For web clients: Convert to Float32 at 44100Hz
+        - For Twilio: Convert to mulaw at 8kHz and send as base64
         """
         if session_id in self.active_calls:
             call = self.active_calls[session_id]
             try:
-                # Convert PCM16 to Float32
-                float_audio = pcm16_to_float32(audio_bytes)
-                # Upsample from 16kHz to 44100Hz
-                upsampled = upsample_audio(float_audio, 16000, 44100)
-                await call.user_ws.send_bytes(upsampled)
+                if call.is_twilio and call.stream_sid:
+                    # Twilio path: PCM16 16kHz -> PCM16 8kHz -> mulaw -> base64
+                    import audioop
+                    import base64
+                    
+                    # Resample from 16kHz to 8kHz
+                    resampled, _ = audioop.ratecv(
+                        audio_bytes,
+                        2,  # 2 bytes per sample (PCM16)
+                        1,  # mono
+                        16000,  # from rate
+                        8000,  # to rate
+                        None
+                    )
+                    
+                    # Convert to mulaw
+                    mulaw_audio = audioop.lin2ulaw(resampled, 2)
+                    
+                    # Encode to base64
+                    payload = base64.b64encode(mulaw_audio).decode('utf-8')
+                    
+                    # Send to Twilio
+                    await call.user_ws.send_json({
+                        "event": "media",
+                        "streamSid": call.stream_sid,
+                        "media": {
+                            "payload": payload
+                        }
+                    })
+                else:
+                    # Web client path: PCM16 16kHz -> Float32 44100Hz
+                    # Convert PCM16 to Float32
+                    float_audio = pcm16_to_float32(audio_bytes)
+                    # Upsample from 16kHz to 44100Hz
+                    upsampled = upsample_audio(float_audio, 16000, 44100)
+                    await call.user_ws.send_bytes(upsampled)
             except Exception as e:
                 logger.error(f"[Handoff] Failed to relay audio to user: {e}")
     

@@ -13,6 +13,7 @@ import logging
 import numpy as np
 import uuid
 from datetime import datetime
+from typing import Literal, cast, Optional
 
 from modules.config import ConfigEnv
 from services.stt import STTService, VADService
@@ -22,12 +23,20 @@ from services.call_analytics import CallAnalyticsService
 from db.connection import get_db
 from services.user_lookup import lookup_user_by_phone, get_user_id_from_phone
 from services.greeting_audio import get_greeting_mulaw_8k_chunks
+from routers.agent import get_handoff_manager
+
+TTSLanguage = Literal["hi", "en", "auto"]
 
 # =========================
 # Router Setup
 # =========================
 router = APIRouter(prefix="/twilio", tags=["twilio"])
 logger = logging.getLogger(__name__)
+
+def normalize_tts_language(lang: str) -> TTSLanguage:
+    if lang in ("hi", "en"):
+        return cast(TTSLanguage, lang)
+    return "auto"
 
 # =========================
 # Twilio Configuration
@@ -124,6 +133,11 @@ async def media_stream(ws: WebSocket):
     detected_language = "en"  # Track detected language from STT
     processing_lock = asyncio.Lock()  # Prevent concurrent LLM calls
     
+    # Handoff state
+    handoff_manager = get_handoff_manager()
+    handoff_session_id = None  # Track if user is in handoff queue or active call
+    is_agent_connected = False  # Track if agent has joined the call
+    
     # Utterance accumulation state
     current_utterance_parts = []  # Accumulate transcripts from same utterance
     utterance_timer_task = None  # Timer to finalize utterance after pause
@@ -131,6 +145,17 @@ async def media_stream(ws: WebSocket):
     
     # Get event loop for thread-safe task creation
     loop = asyncio.get_event_loop()
+    
+    async def check_agent_connected():
+        """Check if an agent has connected to this user's call."""
+        nonlocal is_agent_connected, handoff_session_id
+        if handoff_session_id and handoff_session_id in handoff_manager.active_calls:
+            if not is_agent_connected:
+                is_agent_connected = True
+                logger.info(f"🎧 Agent connected to session {handoff_session_id}")
+            return True
+        is_agent_connected = False
+        return False
 
     async def send_greeting_twilio(websocket: WebSocket, sid: str) -> None:
         """Stream greeting WAV as Twilio media (mulaw 8kHz) then send mark."""
@@ -213,7 +238,7 @@ async def media_stream(ws: WebSocket):
     
     async def finalize_utterance():
         """Finalize accumulated utterance and trigger LLM processing"""
-        nonlocal current_utterance_parts, tts_task
+        nonlocal current_utterance_parts, tts_task, is_agent_connected
         
         if not current_utterance_parts:
             return
@@ -226,6 +251,22 @@ async def media_stream(ws: WebSocket):
             return
         
         logger.info(f"✅ Utterance finalized: {full_text}")
+        
+        # Check if agent is connected - if so, just relay transcript, don't process with LLM
+        if await check_agent_connected() and handoff_session_id:
+            logger.info(f"🎧 Agent connected - skipping LLM, relaying transcript")
+            # Send transcript to agent for display
+            await handoff_manager.relay_message_to_agent(handoff_session_id, {
+                "type": "user_transcript",
+                "text": full_text,
+                "language": detected_language,
+            })
+            # Add to conversation history for record keeping
+            conversation_history.append({
+                "role": "user",
+                "text": full_text
+            })
+            return
         
         # Cancel any ongoing TTS if user spoke
         if tts_task and not tts_task.done():
@@ -303,7 +344,7 @@ async def media_stream(ws: WebSocket):
 
     async def process_and_respond():
         """Process transcript with LLM and stream TTS response to Twilio"""
-        nonlocal tts_task, stream_sid, conversation_history, user_id, is_twilio_call
+        nonlocal tts_task, stream_sid, conversation_history, user_id, is_twilio_call, handoff_session_id
         
         # Use lock to prevent concurrent processing
         async with processing_lock:
@@ -327,6 +368,29 @@ async def media_stream(ws: WebSocket):
             
             logger.info(f"💬 LLM Response: {response_text}")
             
+            # Check if requestHumanAgent tool was called
+            tool_results = llm_result.get("tool_results", [])
+            for result in tool_results:
+                if isinstance(result, dict) and result.get("tool_name") == "requestHumanAgent":
+                    tool_output = result.get("result", {})
+                    # The tool returns {"status": "ok", "action": "handoff_requested", "data": {...}}
+                    if isinstance(tool_output, dict) and tool_output.get("action") == "handoff_requested":
+                        # Add user to handoff queue
+                        handoff_data = tool_output.get("data", {})
+                        reason = handoff_data.get("reason", "User requested human agent")
+                        logger.info(f"📞 Handoff requested: {reason}")
+                        
+                        if user_id and not handoff_session_id:
+                            handoff_session_id = await handoff_manager.request_handoff(
+                                user_id=user_id,
+                                user_ws=ws,
+                                reason=reason,
+                                conversation_history=conversation_history.copy(),
+                                is_twilio=True,
+                                stream_sid=stream_sid
+                            )
+                            logger.info(f"✅ User {user_id} added to handoff queue (session: {handoff_session_id})")
+            
             # Add to conversation history
             conversation_history.append({"role": "assistant", "text": response_text})
             
@@ -336,11 +400,14 @@ async def media_stream(ws: WebSocket):
                 
                 try:
                     # Generate TTS audio chunks (PCM float32 44100Hz)
+                    tts_language = normalize_tts_language(detected_language)
+                    logger.info(f"🔊 TTS using language: {tts_language} (detected: {detected_language})")
                     async for audio_chunk in tts_service.stream_tts(
                         text=response_text,
-                        language=detected_language
+                        language=tts_language
                     ):
-                        if asyncio.current_task().cancelled():
+                        current_task = asyncio.current_task()
+                        if current_task and current_task.cancelled():
                             logger.warning("⚠️ TTS interrupted")
                             return
                         
@@ -455,11 +522,19 @@ async def media_stream(ws: WebSocket):
                         None
                     )
                     
-                    # Stream to Soniox (transcription handled via callbacks)
-                    try:
-                        await asyncio.to_thread(stt_service.stream, resampled)
-                    except Exception as e:
-                        logger.error(f"⚠️ STT streaming error: {e}")
+                    # Check if agent is connected and relay audio
+                    agent_connected = await check_agent_connected()
+                    if agent_connected and handoff_session_id:
+                        # Relay audio to agent (will be converted to Float32 44100Hz)
+                        await handoff_manager.relay_audio_to_agent(handoff_session_id, resampled)
+                        # Skip STT when agent is connected for real-time performance
+                        logger.debug("🎧 Agent connected - bypassing STT for real-time audio")
+                    else:
+                        # Only stream to Soniox when no agent is connected
+                        try:
+                            await asyncio.to_thread(stt_service.stream, resampled)
+                        except Exception as e:
+                            logger.error(f"⚠️ STT streaming error: {e}")
             
             # Handle stream stop
             elif event_type == "stop":
@@ -475,13 +550,22 @@ async def media_stream(ws: WebSocket):
         logger.info("✋ Twilio disconnected")
         if tts_task and not tts_task.done():
             tts_task.cancel()
+        # Clean up handoff if user was in queue or call
+        if handoff_session_id:
+            await handoff_manager.cancel_handoff(handoff_session_id)
+            await handoff_manager.end_call(handoff_session_id, ended_by="user_disconnect")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}", exc_info=True)
         if tts_task and not tts_task.done():
             tts_task.cancel()
-    finally:        # Save call transcript with analytics
+        # Clean up handoff on error
+        if handoff_session_id:
+            await handoff_manager.cancel_handoff(handoff_session_id)
+            await handoff_manager.end_call(handoff_session_id, ended_by="error")
+    finally:
+        # Save call transcript with analytics
         await save_call_transcript()
-                # Cleanup
+        # Cleanup
         try:
             await asyncio.to_thread(stt_service.disconnect)
             logger.info("🔌 Disconnected from Soniox")

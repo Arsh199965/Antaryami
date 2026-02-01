@@ -555,15 +555,17 @@ async def audio_websocket(ws: WebSocket):
                 agent_connected = await check_agent_connected()
                 
                 if agent_connected and handoff_session_id:
-                    # Relay audio to agent
+                    # Relay audio to agent (will be converted to Float32 44100Hz)
                     await handoff_manager.relay_audio_to_agent(handoff_session_id, audio_bytes)
-                
-                # Always stream to Soniox for transcription (useful for agent to see transcript)
-                try:
-                    await asyncio.to_thread(stt_service.stream, audio_bytes)
-                except Exception as e:
-                    print(f"⚠️  STT streaming error: {e}")
-                    # Continue processing, don't crash on STT errors
+                    # Skip STT when agent is connected for real-time performance
+                    print("🎧 Agent connected - bypassing STT for real-time audio")
+                else:
+                    # Only stream to Soniox when no agent is connected
+                    try:
+                        await asyncio.to_thread(stt_service.stream, audio_bytes)
+                    except Exception as e:
+                        print(f"⚠️  STT streaming error: {e}")
+                        # Continue processing, don't crash on STT errors
             
             elif "text" in message:
                 # Handle JSON messages from client
