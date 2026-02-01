@@ -38,7 +38,7 @@ class IntentDetector:
         """
         self.api_key = api_key
         # Use same Bedrock model as pipeline; GEMINI_MODEL_NAME kept for override
-        self.model_name = ConfigEnv.BEDROCK_MODEL_ID
+        self.model_name = ConfigEnv.BEDROCK_MODEL_ID_INTENT
         if not self.model_name:
             raise ValueError(
                 "Set BEDROCK_MODEL_ID or GEMINI_MODEL_NAME in environment variables"
