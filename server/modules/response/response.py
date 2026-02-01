@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional, AsyncGenerator
+from typing import Dict, Any, Optional, AsyncGenerator, Callable, Awaitable, List
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +13,10 @@ from modules.config import ConfigEnv
 from .intent_detector import IntentDetector
 from .llm_client import LLMClient
 from .tool_registry import get_registry
-from .prompts import build_system_prompt
+from langchain_core.messages import SystemMessage
+
+from .prompts import build_system_prompt, build_router_system_prompt, parse_intent_from_router_response
+from .intent_tools_mapping import derive_intent_from_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +56,16 @@ class ResponsePipeline:
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
+        on_before_tool_execution: Optional[Callable[[List[Dict[str, Any]]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
         Process text through the complete pipeline.
 
-        Pipeline flow:
-        1. Intent Detection
-        2. LLM Processing (with tool definitions and conversation history)
-        3. Tool Execution (if needed)
-        4. LLM Response Generation
-        5. Text Output
+        Pipeline flow (2 AI calls max):
+        1. LLM Processing with broad tool set (intent + tool decision in one call)
+        2. Tool Execution (if needed), optionally after on_before_tool_execution (e.g. play tool-wait audio)
+        3. LLM final response (only if tools were called)
+        4. Text Output
 
         Args:
             text: Input text to process.
@@ -70,6 +73,7 @@ class ResponsePipeline:
             session_id: Optional; when set, conversation and intent_log are persisted.
             user_id: Optional; used for conversation.user_id when persisting.
             is_twilio_call: Whether this is a Twilio phone call (no GPS available).
+            on_before_tool_execution: Optional async callback(tool_calls) invoked before running tools (e.g. to play tool-wait audio).
 
         Returns:
             Dictionary containing the final response and metadata.
@@ -79,24 +83,44 @@ class ResponsePipeline:
             logger.info(f"Context: user_id={user_id}, is_twilio_call={is_twilio_call}")
 
             # Build context from conversation history
-            context_prompt = text
             if conversation_history:
-                # Format: USER: hi\nAGENT: Hello! How may I help you?\nUSER: new message
                 history_text = "\n".join(
                     [f"{msg['role'].upper()}: {msg['text']}" for msg in conversation_history]
                 )
-                context_prompt = f"Previous conversation:\n{history_text}\n\nUSER: {text}"
                 logger.info(f"Added conversation context ({len(conversation_history)} turns)")
 
-            # Step 1: Intent Detection (skip when disabled to save one Bedrock round-trip)
-            intent_detection_enabled = ConfigEnv.INTENT_DETECTION_ENABLED
-            if intent_detection_enabled:
-                logger.info("Step 1: Intent Detection")
-                intent_result = await self.intent_detector.detect_intent(text)
-                logger.info(f"Detected intent: {intent_result.get('intent')}")
-            else:
-                logger.info("Step 1: Intent Detection skipped (INTENT_DETECTION_ENABLED=false)")
-                intent_result = {"intent": "general", "confidence": 0.0, "reasoning": "disabled"}
+            # Step 1: Router LLM (intent + tool decision in one call; use router prompt)
+            logger.info("Step 1: Router LLM with tools (intent + tool_calls)")
+            langchain_tools = self.tool_registry.get_langchain_tools(intent="general")
+            logger.info(f"Loaded {len(langchain_tools)} tools for general intent")
+
+            router_prompt = build_router_system_prompt(
+                user_id=user_id,
+                tools=langchain_tools,
+                is_twilio_call=is_twilio_call,
+            )
+            tool_conversation = [{"role": "system", "content": router_prompt}]
+            tool_conversation.extend(conversation_history or [])
+
+            llm_response = await self.llm_client.generate_with_tools(
+                prompt=text,
+                tool_schemas=langchain_tools,
+                conversation_history=tool_conversation,
+                use_fast_model=True,
+            )
+
+            # Parse intent from router response text; fallback to tool names if not found
+            tool_names = [tc.get("name") for tc in llm_response.get("tool_calls", [])]
+            router_text = (llm_response.get("text") or "").strip()
+            parsed_intent = parse_intent_from_router_response(router_text, fallback_intent="general")
+            if parsed_intent == "general" and tool_names:
+                parsed_intent = derive_intent_from_tool_calls(tool_names)
+            intent_result = {
+                "intent": parsed_intent,
+                "confidence": 1.0,
+                "reasoning": "from router prompt" if router_text else "fallback from tool names",
+            }
+            logger.info(f"Intent for logging: {parsed_intent}")
 
             # Persist conversation and intent_log in background (don't block pipeline)
             if session_id:
@@ -127,33 +151,14 @@ class ResponsePipeline:
                     except Exception as e:
                         logger.warning(f"Failed to persist conversation/intent_log: {e}")
                 asyncio.create_task(_persist_conversation_and_intent())
-            
-            # Step 2: LLM Processing with tool definitions (filtered by intent)
-            logger.info("Step 2: LLM Processing with tools")
-            detected_intent = intent_result.get("intent", "general")
-            langchain_tools = self.tool_registry.get_langchain_tools(intent=detected_intent)
-            logger.info(f"Loaded {len(langchain_tools)} tools for intent '{detected_intent}'")
 
-            # Build system prompt with user context and tool instructions
-            system_prompt = build_system_prompt(
-                user_id=user_id, 
-                tools=langchain_tools,
-                is_twilio_call=is_twilio_call,
-            )
-            tool_conversation = [{"role": "system", "content": system_prompt}]
-            tool_conversation.extend(conversation_history or [])
-
-            llm_response = await self.llm_client.generate_with_tools(
-                prompt=text,
-                tool_schemas=langchain_tools,
-                conversation_history=tool_conversation,
-            )
-            
-            # Step 3: Tool Execution (if LLM requested tools) — run in parallel
+            # Step 2: Tool Execution (if LLM requested tools) — optionally run on_before_tool_execution, then run in parallel
             tool_results = []
             if llm_response.get("tool_calls"):
-                logger.info(f"Step 3: Executing {len(llm_response['tool_calls'])} tool(s) in parallel")
                 tool_calls = llm_response["tool_calls"]
+                logger.info(f"Step 2: Executing {len(tool_calls)} tool(s) in parallel")
+                if on_before_tool_execution:
+                    await on_before_tool_execution(tool_calls)
 
                 async def _run_one_tool(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     tool_name = tool_call.get("name")
@@ -182,23 +187,32 @@ class ResponsePipeline:
 
                 tool_results = await asyncio.gather(*[_run_one_tool(tc) for tc in tool_calls])
             
-            # Step 4: Generate final LLM response
-            logger.info("Step 4: Generating final response")
+            # Step 3: Generate final LLM response (only if tools were called); use main system prompt
+            logger.info("Step 3: Generating final response")
             if tool_results:
-                # If tools were called, generate response with tool results
+                # Use main (full) system prompt for final response; replace router prompt in messages
+                main_system = SystemMessage(
+                    content=build_system_prompt(
+                        user_id=user_id,
+                        tools=langchain_tools,
+                        is_twilio_call=is_twilio_call,
+                    )
+                )
+                router_messages = llm_response.get("messages") or []
+                base_for_final = [main_system] + list(router_messages[1:])
                 final_response = await self.llm_client.generate_final_response(
                     prompt=text,
                     tool_results=tool_results,
                     interaction_id=llm_response.get("interaction_id"),
-                    messages=llm_response.get("messages"),
+                    messages=base_for_final,
                     tools=langchain_tools,
                 )
             else:
                 # If no tools were called, use the initial response
                 final_response = llm_response.get("text", "")
             
-            # Step 5: Return text output
-            logger.info("Step 5: Pipeline complete")
+            # Step 4: Return text output
+            logger.info("Step 4: Pipeline complete")
             
             return {
                 "response": final_response,
@@ -227,15 +241,17 @@ class ResponsePipeline:
         conversation_history: list = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
+        on_before_tool_execution: Optional[Callable[[List[Dict[str, Any]]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
-        Process text and stream the final LLM response.
+        Process text and stream the final LLM response (2 AI calls max).
 
         Args:
             text: Input text to process.
             conversation_history: Previous conversation for context.
             user_id: Optional; used for tool calls requiring user identification.
             is_twilio_call: Whether this is a Twilio phone call (no GPS available).
+            on_before_tool_execution: Optional async callback(tool_calls) invoked before running tools (e.g. play tool-wait audio).
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
@@ -244,44 +260,47 @@ class ResponsePipeline:
             logger.info(f"Processing text (streaming): {text[:100]}...")
             logger.info(f"[Pipeline] user_id received: {user_id}, is_twilio_call: {is_twilio_call}")
 
-            # Step 1: Intent Detection (optional for streaming latency)
-            intent_detection_enabled = ConfigEnv.INTENT_DETECTION_ENABLED
-            if intent_detection_enabled:
-                logger.info("Step 1: Intent Detection")
-                intent_result = await self.intent_detector.detect_intent(text)
-                logger.info(f"Detected intent: {intent_result.get('intent')}")
-            else:
-                logger.info("Step 1: Intent Detection skipped (INTENT_DETECTION_ENABLED=false)")
-                intent_result = {"intent": "general", "confidence": 0.0, "reasoning": "disabled"}
+            # Step 1: Router LLM (intent + tool decision in one call; use router prompt + fast model)
+            logger.info("Step 1: Router LLM with tools (intent + tool_calls)")
+            langchain_tools = self.tool_registry.get_langchain_tools(intent="general")
+            logger.info(f"Loaded {len(langchain_tools)} tools for general intent")
 
-            # Step 2: LLM Processing with tool definitions (filtered by intent)
-            logger.info("Step 2: LLM Processing with tools")
-            detected_intent = intent_result.get("intent", "general")
-            langchain_tools = self.tool_registry.get_langchain_tools(intent=detected_intent)
-            logger.info(f"Loaded {len(langchain_tools)} tools for intent '{detected_intent}'")
-
-            # Build system prompt with user context and tool instructions
-            logger.info(f"[Pipeline] Building system prompt with user_id={user_id}, is_twilio_call={is_twilio_call}")
-            system_prompt = build_system_prompt(
-                user_id=user_id, 
+            router_prompt = build_router_system_prompt(
+                user_id=user_id,
                 tools=langchain_tools,
                 is_twilio_call=is_twilio_call,
             )
-            logger.info(f"[Pipeline] System prompt (first 500 chars): {system_prompt[:500]}...")
-            tool_conversation = [{"role": "system", "content": system_prompt}]
+            logger.info(f"[Pipeline] Router prompt (first 500 chars): {router_prompt[:500]}...")
+            tool_conversation = [{"role": "system", "content": router_prompt}]
             tool_conversation.extend(conversation_history or [])
 
             llm_response = await self.llm_client.generate_with_tools(
                 prompt=text,
                 tool_schemas=langchain_tools,
                 conversation_history=tool_conversation,
+                use_fast_model=True,
             )
 
-            # Step 3: Tool Execution (if LLM requested tools) — run in parallel
+            # Parse intent from router response text; fallback to tool names for logging
+            tool_names = [tc.get("name") for tc in llm_response.get("tool_calls", [])]
+            router_text = (llm_response.get("text") or "").strip()
+            parsed_intent = parse_intent_from_router_response(router_text, fallback_intent="general")
+            if parsed_intent == "general" and tool_names:
+                parsed_intent = derive_intent_from_tool_calls(tool_names)
+            intent_result = {
+                "intent": parsed_intent,
+                "confidence": 1.0,
+                "reasoning": "from router prompt" if router_text else "fallback from tool names",
+            }
+            logger.info(f"Intent for logging: {parsed_intent}")
+
+            # Step 2: Tool Execution (if LLM requested tools) — optionally on_before_tool_execution, then run in parallel
             tool_results = []
             if llm_response.get("tool_calls"):
-                logger.info(f"Step 3: Executing {len(llm_response['tool_calls'])} tool(s) in parallel")
+                logger.info(f"Step 2: Executing {len(llm_response['tool_calls'])} tool(s) in parallel")
                 tool_calls = llm_response["tool_calls"]
+                if on_before_tool_execution:
+                    await on_before_tool_execution(tool_calls)
 
                 async def _run_one_tool_stream(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     tool_name = tool_call.get("name")
@@ -310,13 +329,22 @@ class ResponsePipeline:
 
                 tool_results = await asyncio.gather(*[_run_one_tool_stream(tc) for tc in tool_calls])
 
-            # Step 4: Stream final LLM response
-            logger.info("Step 4: Streaming final response")
+            # Step 3: Stream final LLM response; use main system prompt when tools were called
+            logger.info("Step 3: Streaming final response")
             if tool_results:
+                main_system = SystemMessage(
+                    content=build_system_prompt(
+                        user_id=user_id,
+                        tools=langchain_tools,
+                        is_twilio_call=is_twilio_call,
+                    )
+                )
+                router_messages = llm_response.get("messages") or []
+                base_for_final = [main_system] + list(router_messages[1:])
                 stream = self.llm_client.stream_response(
                     prompt=text,
                     tool_results=tool_results,
-                    messages=llm_response.get("messages"),
+                    messages=base_for_final,
                     tools=langchain_tools,
                 )
             else:

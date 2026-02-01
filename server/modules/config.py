@@ -33,6 +33,9 @@ class ConfigEnv:
     BEDROCK_REGION = os.getenv("BEDROCK_REGION")
     BEDROCK_TEMPERATURE = convert_to_float(os.getenv("BEDROCK_TEMPERATURE", "0.7")) or 0.7
     BEDROCK_MAX_TOKENS = convert_to_int(os.getenv("BEDROCK_MAX_TOKENS"))
+    # Fast model for router step (intent + tool decision); if unset, use BEDROCK_MODEL_ID
+    BEDROCK_FAST_MODEL_ID = os.getenv("BEDROCK_FAST_MODEL_ID")
+    BEDROCK_FAST_MAX_TOKENS = convert_to_int(os.getenv("BEDROCK_FAST_MAX_TOKENS", "256"))
     AWS_REGION = os.getenv("AWS_REGION")
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -70,8 +73,13 @@ class ConfigEnv:
     ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 
     # ----- Feature flags -----
+    # Note: Pipeline no longer runs a separate intent-detection call; intent is derived from the first LLM call (tool names).
+    # This var is kept for optional re-enable or analytics; pipeline uses 2 AI calls max (first call = intent + tools, second = final response).
     _ide = (os.getenv("INTENT_DETECTION_ENABLED", "true") or "").strip().lower()
     INTENT_DETECTION_ENABLED = _ide not in {"0", "false", "no", "off"}
+
+    # ----- Audio (optional paths) -----
+    # TOOL_WAIT_AUDIO_PATH: Path to WAV played when tools will run (default: project root / cartesia_audio_tool_wait_voice.wav)
 
     REQUIRED = [
         # "GEMINI_API_KEY",

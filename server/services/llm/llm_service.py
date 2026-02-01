@@ -3,6 +3,7 @@ LLM Service - Language Model Processing
 Handles LLM interactions for processing transcripts using the response pipeline
 """
 import logging
+from typing import Callable, Awaitable, List, Dict, Any, Optional
 
 from modules.config import ConfigEnv
 from modules.response.response import ResponsePipeline
@@ -35,15 +36,15 @@ class LLMService:
         session_id: str = None,
         user_id: str = None,
         is_twilio_call: bool = False,
+        on_before_tool_execution: Optional[Callable[[List[Dict[str, Any]]], Awaitable[None]]] = None,
     ) -> dict:
         """
-        Process transcript through the complete pipeline.
+        Process transcript through the complete pipeline (2 AI calls max when tools used).
 
         Pipeline flow:
-        1. Intent Detection
-        2. LLM Processing (with tool definitions and conversation context)
-        3. Tool Execution (if needed)
-        4. LLM Response Generation
+        1. LLM with broad tools (intent + tool decision in one call)
+        2. Tool Execution (if needed), optionally after on_before_tool_execution (e.g. play tool-wait audio)
+        3. LLM final response (only if tools were called)
 
         Args:
             transcript: The transcribed text to process
@@ -51,11 +52,12 @@ class LLMService:
             session_id: Optional; when set, conversation and intent_log are persisted
             user_id: Optional; used for conversation.user_id when persisting
             is_twilio_call: Whether this is a Twilio phone call (no GPS available)
+            on_before_tool_execution: Optional async callback(tool_calls) invoked before running tools (e.g. play tool-wait audio)
 
         Returns:
             Dictionary containing:
             - response: Final text response
-            - intent: Detected intent information
+            - intent: Derived intent (from tool calls) for logging
             - tool_calls: List of tools that were called
             - tool_results: Results from tool execution
         """
@@ -69,6 +71,7 @@ class LLMService:
                 session_id=session_id,
                 user_id=user_id,
                 is_twilio_call=is_twilio_call,
+                on_before_tool_execution=on_before_tool_execution,
             )
             
             logger.info(f"LLM processing complete. Response: {result.get('response', '')[:100]}...")
@@ -91,15 +94,17 @@ class LLMService:
         conversation_history: list = None,
         user_id: str | None = None,
         is_twilio_call: bool = False,
+        on_before_tool_execution: Optional[Callable[[List[Dict[str, Any]]], Awaitable[None]]] = None,
     ) -> dict:
         """
-        Process transcript and stream the LLM response.
+        Process transcript and stream the LLM response (2 AI calls max when tools used).
 
         Args:
             transcript: The transcribed text to process
             conversation_history: Previous conversation turns for context
             user_id: Optional; used for tool calls requiring user identification
             is_twilio_call: Whether this is a Twilio phone call (no GPS available)
+            on_before_tool_execution: Optional async callback(tool_calls) invoked before running tools (e.g. play tool-wait audio)
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
@@ -113,6 +118,7 @@ class LLMService:
                 conversation_history,
                 user_id=user_id,
                 is_twilio_call=is_twilio_call,
+                on_before_tool_execution=on_before_tool_execution,
             )
             return result
         except Exception as e:

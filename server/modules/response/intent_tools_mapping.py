@@ -126,7 +126,7 @@ def get_tools_for_intent(intent: str) -> Set[str]:
 def get_all_tool_names() -> Set[str]:
     """
     Get all unique tool names from the mapping.
-    
+
     Returns:
         Set of all tool names.
     """
@@ -134,3 +134,36 @@ def get_all_tool_names() -> Set[str]:
     for tools in INTENT_TOOL_MAPPING.values():
         all_tools.update(tools)
     return all_tools
+
+
+# Map tool names to intent for logging when intent is derived from first LLM call
+TOOL_TO_INTENT: Dict[str, str] = {
+    "getNearestStation": "station_query",
+    "getCurrentLocation": "location_query",
+    "getLastServiceCenterVisit": "service_center_query",
+    "getLastSwapAttempt": "swap_attempt_query",
+    "getBatteryInfo": "battery_query",
+    "reportBatteryIssue": "problem_report",
+    "getProblemContext": "problem_report",
+    "getCallInsights": "service_request",
+    "getSubscriptionInfo": "subscription_query",
+    "getUserInfo": "user_query",
+    "requestHumanAgent": "human_handoff",
+    "geocodeAddress": "location_query",
+}
+
+
+def derive_intent_from_tool_calls(tool_names: List[str]) -> str:
+    """
+    Derive intent category from tool names called (for logging/analytics).
+
+    Args:
+        tool_names: List of tool names from the first LLM response.
+
+    Returns:
+        Intent string (e.g. station_query, battery_query, general).
+    """
+    for name in tool_names:
+        if name in TOOL_TO_INTENT:
+            return TOOL_TO_INTENT[name]
+    return "general"

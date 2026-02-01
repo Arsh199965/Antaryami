@@ -22,7 +22,7 @@ from services.tts import TTSService
 from services.call_analytics import CallAnalyticsService
 from db.connection import get_db
 from services.user_lookup import lookup_user_by_phone, get_user_id_from_phone
-from services.greeting_audio import get_greeting_mulaw_8k_chunks
+from services.greeting_audio import get_greeting_mulaw_8k_chunks, get_tool_wait_mulaw_8k_chunks
 from routers.agent import get_handoff_manager
 
 TTSLanguage = Literal["hi", "en", "auto"]
@@ -195,6 +195,23 @@ async def media_stream(ws: WebSocket):
             logger.info("✅ Greeting audio sent to Twilio")
         except Exception as e:
             logger.warning("Failed to send greeting to Twilio: %s", e)
+
+    async def send_tool_wait_audio_twilio(websocket: WebSocket, sid: Optional[str]) -> None:
+        """Stream tool-wait WAV (Hindi: please wait) as Twilio media (mulaw 8kHz)."""
+        if not sid:
+            return
+        try:
+            chunks = get_tool_wait_mulaw_8k_chunks()
+            for chunk in chunks:
+                payload = base64.b64encode(chunk).decode("utf-8")
+                await websocket.send_json({
+                    "event": "media",
+                    "streamSid": sid,
+                    "media": {"payload": payload},
+                })
+            logger.info("✅ Tool-wait audio sent to Twilio")
+        except Exception as e:
+            logger.warning("Failed to send tool-wait audio to Twilio: %s", e)
     
     # Initialize services
     vad_service = VADService()
@@ -376,12 +393,16 @@ async def media_stream(ws: WebSocket):
             logger.info(f"📄 Processing: {full_transcript}")
             logger.info(f"📱 User ID: {user_id}, Is Twilio Call: {is_twilio_call}")
             
-            # Process with LLM - pass user_id and is_twilio_call context
+            # Process with LLM - pass user_id, is_twilio_call, and callback to play tool-wait audio when tools will run
+            async def on_before_tool_execution(_tool_calls):
+                await send_tool_wait_audio_twilio(ws, stream_sid)
+
             llm_result = await llm_service.process(
-                full_transcript, 
+                full_transcript,
                 conversation_history,
                 user_id=user_id,
                 is_twilio_call=True,  # This is a Twilio phone call - no GPS available
+                on_before_tool_execution=on_before_tool_execution,
             )
             response_text = llm_result.get('response', '')
             

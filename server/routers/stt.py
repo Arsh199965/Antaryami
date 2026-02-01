@@ -21,7 +21,7 @@ from modules.config import ConfigEnv
 from modules.response.tool_registry import get_registry
 from db.connection import get_db
 from routers.agent import get_handoff_manager
-from services.greeting_audio import get_greeting_float32_44100_chunks
+from services.greeting_audio import get_greeting_float32_44100_chunks, get_tool_wait_float32_44100_chunks
 
 TTSLanguage = Literal["hi", "en", "auto"]
 
@@ -393,13 +393,20 @@ async def audio_websocket(ws: WebSocket):
                 "text": full_transcript
             })
             
-            # Process with LLM pipeline (streaming)
+            # Process with LLM pipeline (streaming); play tool-wait audio when tools will run
+            async def on_before_tool_execution(_tool_calls):
+                await ws.send_json({"type": "audio_start"})
+                for chunk in get_tool_wait_float32_44100_chunks():
+                    await ws.send_bytes(chunk)
+                await ws.send_json({"type": "audio_end"})
+
             print(f"🤖 Calling LLM service (streaming) with conversation context ({len(conversation_history)} turns)...")
             print(f"🔑 user_id being passed to LLM: {user_id}")
             llm_result = await llm_service.process_stream(
                 full_transcript,
                 conversation_history,
                 user_id=user_id,
+                on_before_tool_execution=on_before_tool_execution,
             )
 
             stream = llm_result.get("stream")

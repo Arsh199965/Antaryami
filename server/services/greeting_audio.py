@@ -14,12 +14,14 @@ import soundfile as sf
 logger = logging.getLogger(__name__)
 
 DEFAULT_FILENAME = "cartesia_audio_2026-02-01T10_08_31+05_30.wav"
+TOOL_WAIT_DEFAULT_FILENAME = "cartesia_audio_tool_wait_voice.wav"
 TWILIO_CHUNK_MS = 20
 TWILIO_SAMPLE_RATE = 8000
 APP_SAMPLE_RATE = 44100
 
 # (samples_float32, sample_rate) or None if load failed
 _cached: Optional[Tuple[np.ndarray, int]] = None
+_tool_wait_cached: Optional[Tuple[np.ndarray, int]] = None
 
 
 def _get_greeting_path() -> Path:
@@ -96,6 +98,89 @@ def get_greeting_float32_44100_chunks(chunk_size: int = 4096) -> Generator[bytes
     samples, sr = loaded
     if sr != APP_SAMPLE_RATE:
         # Resample to 44100 using linear interpolation
+        n_old = len(samples)
+        n_new = int(round(n_old * APP_SAMPLE_RATE / sr))
+        old_indices = np.arange(n_old, dtype=np.float64)
+        new_indices = np.linspace(0, n_old - 1, n_new, dtype=np.float64)
+        samples = np.interp(new_indices, old_indices, samples).astype(np.float32)
+    for i in range(0, len(samples), chunk_size):
+        chunk = samples[i : i + chunk_size]
+        if len(chunk) == 0:
+            continue
+        yield chunk.tobytes()
+
+
+# ----- Tool-wait audio ("ham aapki sahayta ke liye tatpar hai kripya pariksha kare") -----
+
+
+def _get_tool_wait_path() -> Path:
+    """Resolve path to tool-wait WAV: env TOOL_WAIT_AUDIO_PATH or project root default."""
+    env_path = os.getenv("TOOL_WAIT_AUDIO_PATH")
+    if env_path:
+        return Path(env_path)
+    project_root = Path(__file__).resolve().parent.parent.parent
+    return project_root / TOOL_WAIT_DEFAULT_FILENAME
+
+
+def _load_tool_wait() -> Optional[Tuple[np.ndarray, int]]:
+    """Load tool-wait WAV once; return (float32 mono samples, sample_rate) or None."""
+    global _tool_wait_cached
+    if _tool_wait_cached is not None:
+        return _tool_wait_cached
+    path = _get_tool_wait_path()
+    if not path.exists():
+        logger.warning("Tool-wait audio file not found: %s", path)
+        _tool_wait_cached = None
+        return None
+    try:
+        data, sr = sf.read(path, dtype="float32")
+        if data.ndim > 1:
+            data = data[:, 0]
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        _tool_wait_cached = (data, int(sr))
+        logger.info("Loaded tool-wait audio: %s (rate=%d, samples=%d)", path, sr, len(data))
+        return _tool_wait_cached
+    except Exception as e:
+        logger.exception("Failed to load tool-wait audio %s: %s", path, e)
+        _tool_wait_cached = None
+        return None
+
+
+def get_tool_wait_mulaw_8k_chunks() -> List[bytes]:
+    """
+    Return tool-wait audio as 20ms mulaw 8kHz chunks for Twilio media.
+    Each chunk is 160 bytes (160 samples at 8kHz).
+    """
+    loaded = _load_tool_wait()
+    if loaded is None:
+        return []
+    samples, sr = loaded
+    pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    pcm_bytes = pcm16.tobytes()
+    if sr != TWILIO_SAMPLE_RATE:
+        pcm_bytes, _ = audioop.ratecv(
+            pcm_bytes, 2, 1, sr, TWILIO_SAMPLE_RATE, None
+        )
+    mulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
+    chunk_size = 160
+    chunks = []
+    for i in range(0, len(mulaw_bytes), chunk_size):
+        chunk = mulaw_bytes[i : i + chunk_size]
+        if chunk:
+            chunks.append(bytes(chunk))
+    return chunks
+
+
+def get_tool_wait_float32_44100_chunks(chunk_size: int = 4096) -> Generator[bytes, None, None]:
+    """
+    Yield tool-wait audio as float32 44100 Hz chunks (bytes) for app WebSocket.
+    Each chunk is chunk_size samples as float32 little-endian.
+    """
+    loaded = _load_tool_wait()
+    if loaded is None:
+        return
+    samples, sr = loaded
+    if sr != APP_SAMPLE_RATE:
         n_old = len(samples)
         n_new = int(round(n_old * APP_SAMPLE_RATE / sr))
         old_indices = np.arange(n_old, dtype=np.float64)

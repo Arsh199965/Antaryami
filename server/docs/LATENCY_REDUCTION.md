@@ -7,16 +7,20 @@ This document summarizes **latency sources** in the text/voice pipeline and **co
 The main latency path is:
 
 1. **REST** `/api/text/process` or **WebSocket** (Twilio/STT) → `LLMService.process()` → `ResponsePipeline.process_text()`
-2. **Pipeline steps**: Intent Detection → DB persistence (conversation + intent_log) → LLM with tools → Tool execution → Final LLM response
+2. **Pipeline steps (2 AI calls max):** LLM with broad tools (intent + tool decision in one call) → optional tool-wait audio → Tool execution → Final LLM response (only if tools were called). Intent is **derived from the first LLM call** (from tool names) for logging; no separate intent-detection round-trip.
 
 Each step adds round-trip or I/O time. Below are the main sources and mitigations.
 
 ---
 
-## 1. Intent Detection = Extra Bedrock Round-Trip
+## 1. Two-Call Pipeline (Intent Merged into First Call)
 
-**Where:** `modules/response/response.py` → `intent_detector.detect_intent()`  
-**Cost:** One full Bedrock LLM call (~200–800 ms) before the main LLM call.
+**Where:** `modules/response/response.py`  
+**Change:** The pipeline no longer runs a separate intent-detection Bedrock call. The first LLM call uses a broad tool set (`general` intent) so the model both understands the user and decides which tools to call in one round-trip. Intent for logging/analytics is derived from the tool names returned (e.g. `getNearestStation` to `station_query`).
+
+**Result:** 1 AI call when no tools are used; 2 AI calls when tools are used (first = intent + tool decision, second = final response with tool results). Saves ~200–600 ms when tools are used.
+
+**Tool-wait audio:** When the first LLM returns tool calls, an optional callback `on_before_tool_execution` runs before running tools (e.g. play a pre-recorded "please wait" clip so the user hears feedback while tools and the second call run). Twilio and STT routers pass this callback; see `services/greeting_audio.py` for `get_tool_wait_mulaw_8k_chunks()` / `get_tool_wait_float32_44100_chunks()`. Set `TOOL_WAIT_AUDIO_PATH` in `.env` to override the default WAV path.
 
 **Mitigations:**
 
@@ -131,10 +135,12 @@ Each step adds round-trip or I/O time. Below are the main sources and mitigation
 
 | Change | File(s) | Effect |
 |--------|--------|--------|
+| Two-call pipeline (intent merged) | `modules/response/response.py`, `intent_tools_mapping.py` | Intent + tool decision in one LLM call; intent derived from tool names; 2 AI calls max |
+| Tool-wait audio hook + loader | `modules/response/response.py`, `services/greeting_audio.py` | `on_before_tool_execution` callback; `get_tool_wait_*` chunks; `TOOL_WAIT_AUDIO_PATH` env |
+| Tool-wait in Twilio/STT | `routers/twilio.py`, `routers/stt.py` | Play tool-wait WAV when tools will run |
 | Enable MongoDB indexes on startup | `main.py`, `db/indexes.py` | Faster DB queries; add `phone_number` for Twilio lookup |
 | DB persistence in background | `modules/response/response.py` | Don’t wait for conversation/intent_log writes before LLM |
 | Parallel tool execution | `modules/response/response.py` | Multiple tools run concurrently |
-| Skip intent when disabled (non-streaming) | `modules/response/response.py` | One fewer Bedrock call when `INTENT_DETECTION_ENABLED=false` |
 | Call insights in thread pool | `modules/response/tools/call_insights.py` | Avoid blocking event loop on embedding + Pinecone |
 
 ---
@@ -144,9 +150,9 @@ Each step adds round-trip or I/O time. Below are the main sources and mitigation
 - [x] Enable `create_indexes(db)` and add `users.phone_number` index
 - [x] Fire-and-forget DB persistence for conversation/intent_log
 - [x] Parallelize tool execution with `asyncio.gather`
-- [x] Respect `INTENT_DETECTION_ENABLED` in non-streaming `process_text`
+- [x] Two-call pipeline: intent merged into first LLM call; intent derived from tool names
 - [x] Run call_insights sync code in `asyncio.to_thread`
 - [ ] Refactor getNearestStation to use MongoDB geo query ($geoNear / 2dsphere)
 - [ ] Parallelize getUserInfo sub-queries (vehicle, battery, subscriptions)
 - [ ] Optional: in-memory cache for phone → user_id in Twilio flow
-- [ ] Consider lighter intent classifier (keywords + fallback to LLM)
+- [x] Tool-wait audio when tools will run (Twilio + STT); optional `TOOL_WAIT_AUDIO_PATH`

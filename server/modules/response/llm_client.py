@@ -61,6 +61,15 @@ class LLMClient:
             max_tokens=self.max_tokens,
             region_name=self.region_name,
         )
+        # Fast model for router step (intent + tools); fallback to main model if not set
+        fast_model_id = ConfigEnv.BEDROCK_FAST_MODEL_ID or self.model_name
+        fast_max_tokens = ConfigEnv.BEDROCK_FAST_MAX_TOKENS or 256 or self.max_tokens
+        self.fast_model = ChatBedrockConverse(
+            model=fast_model_id,
+            temperature=self.temperature,
+            max_tokens=fast_max_tokens,
+            region_name=self.region_name,
+        )
 
     def _build_messages(
         self,
@@ -104,6 +113,7 @@ class LLMClient:
         prompt: str,
         tool_schemas: List[Any],
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        use_fast_model: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a response with tool calling support using LangChain.
@@ -112,17 +122,19 @@ class LLMClient:
             prompt: The user prompt.
             tool_schemas: List of available tool schemas.
             conversation_history: Optional conversation history (not used in initial call).
+            use_fast_model: If True, use the fast (router) model for intent + tool decision; else main model.
             
         Returns:
             Dictionary containing the response, tool calls, and interaction ID.
         """
         try:
             tools = tool_schemas or []
-            logger.info(f"[LLMClient] Number of tools available: {len(tools)}")
+            model = self.fast_model if use_fast_model else self.model
+            logger.info(f"[LLMClient] generate_with_tools use_fast_model={use_fast_model}, tools={len(tools)}")
             for t in tools:
                 logger.info(f"[LLMClient] Tool: {t.name} - {t.description[:50]}...")
             
-            llm = self.model.bind_tools(tools) if tools else self.model
+            llm = model.bind_tools(tools) if tools else model
 
             messages = self._build_messages(prompt, conversation_history)
             logger.info(f"[LLMClient] Messages to LLM: {[type(m).__name__ for m in messages]}")
@@ -141,8 +153,10 @@ class LLMClient:
                     "call_id": tool_call.get("id"),
                 })
 
+            # Normalize content to str (Bedrock can return list of blocks e.g. [{"type": "text", "text": "..."}, ...])
+            text = self._normalize_content(response.content) if response.content else ""
             return {
-                "text": response.content or "",
+                "text": text,
                 "tool_calls": tool_calls,
                 "messages": [*messages, response],
                 "interaction_id": getattr(response, "id", None),

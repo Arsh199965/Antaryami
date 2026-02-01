@@ -1,7 +1,13 @@
 """System prompts for the LLM including tool instructions."""
 
+import re
 from typing import Optional, List
 from langchain_core.tools import StructuredTool
+
+from .intent_detector import IntentDetector
+
+# Intent categories for router prompt (same as intent_detector for consistency)
+ROUTER_INTENT_CATEGORIES = IntentDetector.INTENT_CATEGORIES
 
 
 def build_system_prompt(
@@ -115,6 +121,93 @@ def build_system_prompt(
     )
     
     return "\n".join(prompt_parts)
+
+
+# Default max tokens for router step (intent + tool decision only)
+ROUTER_MAX_TOKENS_GUIDELINE = 256
+
+
+def build_router_system_prompt(
+    user_id: Optional[str] = None,
+    tools: Optional[List[StructuredTool]] = None,
+    is_twilio_call: bool = False,
+    max_tokens_guideline: int = ROUTER_MAX_TOKENS_GUIDELINE,
+) -> str:
+    """
+    Build the system prompt for the first step (router): classify query type (intent)
+    and decide which tools to call. Used with a fast model; keep response short.
+
+    Args:
+        user_id: The user's ID for tool calls requiring user identification.
+        tools: List of available tools (same as general intent).
+        is_twilio_call: Whether this is a phone call via Twilio (no GPS available).
+        max_tokens_guideline: Suggested max tokens for this step.
+
+    Returns:
+        Router system prompt string.
+    """
+    categories_str = ", ".join(ROUTER_INTENT_CATEGORIES)
+    prompt_parts = [
+        "You are the routing step for a battery swap customer service assistant.",
+        "Your job is to (1) classify the user's query type (intent) and (2) call any tools needed to answer it.",
+        f"Use at most {max_tokens_guideline} tokens for any text in this step; only classify intent and issue tool calls. Do not generate the full answer here.",
+        "",
+        "INTENT OUTPUT (required):",
+        "You must classify the query type. Start your text response with exactly: Intent: <category>",
+        f"where category is one of: {categories_str}",
+        "Examples: Intent: station_query , Intent: battery_query , Intent: general",
+        "",
+        "MULTIPLE TOOLS:",
+        "You may call multiple tools in one turn when the user query requires it (e.g. getUserInfo and getNearestStation). Call all needed tools in this single response.",
+    ]
+    if user_id:
+        prompt_parts.append(
+            f"\nCURRENT USER CONTEXT:\n- User ID: {user_id}\n- Use this user_id when calling any tool that requires a userId parameter."
+        )
+    if is_twilio_call:
+        prompt_parts.append(
+            "\nPHONE CALL CONTEXT: This user is on a phone call (Twilio). GPS is NOT available. Do NOT use getCurrentLocation. For location, use geocodeAddress after the user provides an address/landmark."
+        )
+    if tools:
+        prompt_parts.append("\nAVAILABLE TOOLS:")
+        prompt_parts.append("You have access to the following tools. Call the ones needed for the user's query:")
+        for tool in tools:
+            prompt_parts.append(f"- {tool.name}: {tool.description}")
+        prompt_parts.append(
+            "\nCall the appropriate tool(s) now. You may call multiple tools in one response when needed."
+        )
+    return "\n".join(prompt_parts)
+
+
+# Regex to parse "Intent: <category>" from router response (case-insensitive, flexible whitespace)
+_INTENT_LINE_RE = re.compile(r"^\s*Intent\s*:\s*(\w+)\s*", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_intent_from_router_response(
+    text: str,
+    fallback_intent: str = "general",
+) -> str:
+    """
+    Parse intent from the first step (router) LLM text response.
+    Expects a line like "Intent: station_query" at the start.
+
+    Args:
+        text: The text content from the router LLM response (may be empty if only tool_calls returned).
+        fallback_intent: Intent to return if no valid "Intent: <category>" line is found.
+
+    Returns:
+        Intent category string (e.g. station_query, general).
+    """
+    if not text or not text.strip():
+        return fallback_intent
+    match = _INTENT_LINE_RE.search(text.strip())
+    if not match:
+        return fallback_intent
+    raw = match.group(1).strip().lower()
+    for c in ROUTER_INTENT_CATEGORIES:
+        if c.lower() == raw:
+            return c
+    return fallback_intent
 
 
 def build_tool_result_prompt(tool_name: str, result: dict) -> str:
