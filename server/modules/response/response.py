@@ -37,7 +37,7 @@ class ResponsePipeline:
         _model_name = model_name or ConfigEnv.BEDROCK_MODEL_ID
         if not _model_name:
             raise ValueError("BEDROCK_MODEL_ID must be set in environment variables or provided")
-        self.intent_detector = IntentDetector(api_key=api_key)
+        self.intent_detector = IntentDetector()
         self.llm_client = LLMClient(
             api_key=api_key,
             model_name=_model_name,

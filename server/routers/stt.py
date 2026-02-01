@@ -92,7 +92,7 @@ async def audio_websocket(ws: WebSocket):
 
     user_id = None
     call_id = str(uuid.uuid4())  # Unique identifier for this call
-    call_start_time = datetime.utcnow()
+    call_start_time = datetime.now()
 
     async def send_user_info():
         """Fetch basic user info via tool call when the call connects."""

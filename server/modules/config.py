@@ -29,6 +29,8 @@ class ConfigEnv:
 
     # ----- Bedrock / AWS -----
     BEDROCK_API_KEY = os.getenv("BEDROCK_API_KEY", "")
+    BEDROCK_MODEL_ID_INTENT = os.getenv("BEDROCK_MODEL_ID_INTENT")
+    
     BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")
     BEDROCK_REGION = os.getenv("BEDROCK_REGION")
     BEDROCK_TEMPERATURE = convert_to_float(os.getenv("BEDROCK_TEMPERATURE", "0.7")) or 0.7
