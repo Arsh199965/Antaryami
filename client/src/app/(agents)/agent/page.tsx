@@ -405,6 +405,15 @@ export default function AgentPage() {
       // Handle binary audio data from user
       if (event.data instanceof Blob) {
         const arrayBuffer = await event.data.arrayBuffer();
+        
+        // Validate that byte length is a multiple of 4 (required for Float32Array)
+        if (arrayBuffer.byteLength % 4 !== 0) {
+          console.error(
+            `Invalid audio data: byte length ${arrayBuffer.byteLength} is not a multiple of 4`,
+          );
+          return;
+        }
+        
         const audioData = new Float32Array(arrayBuffer);
         audioQueueRef.current.push(audioData);
         playAudioQueue();

@@ -149,11 +149,30 @@ async def media_stream(ws: WebSocket):
     
     async def check_agent_connected():
         """Check if an agent has connected to this user's call."""
-        nonlocal is_agent_connected, handoff_session_id
+        nonlocal is_agent_connected, handoff_session_id, tts_task
         if handoff_session_id and handoff_session_id in handoff_manager.active_calls:
             if not is_agent_connected:
+                # Agent just connected - cancel any ongoing TTS immediately
                 is_agent_connected = True
                 logger.info(f"🎧 Agent connected to session {handoff_session_id}")
+                
+                # Cancel TTS task if running
+                if tts_task and not tts_task.done():
+                    logger.info("🛑 Cancelling TTS - agent has joined")
+                    tts_task.cancel()
+                    try:
+                        await tts_task
+                    except asyncio.CancelledError:
+                        pass
+                    tts_task = None
+                
+                # Clear Twilio audio buffer
+                if stream_sid:
+                    await ws.send_json({
+                        "event": "clear",
+                        "streamSid": stream_sid
+                    })
+                    logger.info(f"🧹 Cleared Twilio audio buffer for stream {stream_sid}")
             return True
         is_agent_connected = False
         return False

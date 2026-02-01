@@ -181,6 +181,9 @@ class HandoffManager:
             
             logger.info(f"[Handoff] Agent {agent_id} accepted call {session_id} from user {handoff.user_id}")
             
+            # Cancel any ongoing TTS and clear audio buffer IMMEDIATELY
+            await self.cancel_user_tts(session_id)
+            
             # Notify user that agent connected
             try:
                 await handoff.user_ws.send_json({
@@ -253,6 +256,29 @@ class HandoffManager:
                     "session_id": session_id,
                 })
     
+    async def cancel_user_tts(self, session_id: str):
+        """Cancel any ongoing TTS and clear audio buffer for user."""
+        if session_id in self.active_calls:
+            call = self.active_calls[session_id]
+            try:
+                if call.is_twilio and call.stream_sid:
+                    # Send clear command to Twilio to empty audio buffer
+                    import json
+                    await call.user_ws.send_json({
+                        "event": "clear",
+                        "streamSid": call.stream_sid
+                    })
+                    logger.info(f"[Handoff] Sent clear command to Twilio stream {call.stream_sid}")
+                else:
+                    # For web clients, send interrupt message
+                    await call.user_ws.send_json({
+                        "type": "agent_joined",
+                        "message": "Agent has joined the call"
+                    })
+                    logger.info(f"[Handoff] Notified web client of agent join")
+            except Exception as e:
+                logger.error(f"[Handoff] Failed to cancel TTS: {e}")
+    
     async def relay_audio_to_agent(self, session_id: str, audio_bytes: bytes):
         """Relay audio from user to agent.
         
@@ -262,10 +288,27 @@ class HandoffManager:
         if session_id in self.active_calls:
             call = self.active_calls[session_id]
             try:
+                # Validate PCM16 data is properly aligned (multiple of 2 bytes)
+                if len(audio_bytes) % 2 != 0:
+                    logger.warning(f"[Handoff] Invalid PCM16 data length: {len(audio_bytes)} (not multiple of 2)")
+                    return
+                
                 # Convert PCM16 to Float32
                 float_audio = pcm16_to_float32(audio_bytes)
+                
+                # Validate Float32 data is properly aligned (multiple of 4 bytes)
+                if len(float_audio) % 4 != 0:
+                    logger.error(f"[Handoff] Float32 conversion produced invalid length: {len(float_audio)}")
+                    return
+                
                 # Upsample from 16kHz to 44100Hz
                 upsampled = upsample_audio(float_audio, 16000, 44100)
+                
+                # Final validation
+                if len(upsampled) % 4 != 0:
+                    logger.error(f"[Handoff] Upsampled audio has invalid length: {len(upsampled)}")
+                    return
+                
                 # Send to agent
                 await call.agent_ws.send_bytes(upsampled)
             except Exception as e:
