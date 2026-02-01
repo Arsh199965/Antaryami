@@ -12,7 +12,7 @@ torch.set_num_threads(1)
 # Configuration
 # =========================
 SAMPLE_RATE = 16000
-SPEECH_THRESHOLD = 0.6
+SPEECH_THRESHOLD = 0.75
 
 
 # =========================

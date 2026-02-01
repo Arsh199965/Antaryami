@@ -335,18 +335,28 @@ class TTSService:
                 del self.active_contexts[context_id]
             raise
     
-    async def close(self):
-        """Close the Cartesia client and all active contexts."""
-        # Close all active contexts
-        for context_id, context_data in list(self.active_contexts.items()):
-            try:
-                await context_data["ws"].close()
-            except:
-                pass
-        self.active_contexts.clear()
-        
-        # Close the client
-        await self.client.close()
+async def close(self) -> None:
+    """Gracefully shut down all TTS resources."""
+
+    # Close all active contexts first
+    for ctx in list(self.active_contexts.values()):
+        try:
+            await ctx["ctx"].cancel()
+        except Exception:
+            pass
+        try:
+            await ctx["ws"].close()
+        except Exception:
+            pass
+
+    self.active_contexts.clear()
+
+    # Close Cartesia client
+    if self.client:
+        result = self.client.close()
+        if asyncio.iscoroutine(result):
+            await result
+
 
 
 # Singleton instance
