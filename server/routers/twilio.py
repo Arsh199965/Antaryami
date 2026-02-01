@@ -432,57 +432,11 @@ async def media_stream(ws: WebSocket):
                         None
                     )
                     
-                    # Stream to Soniox
+                    # Stream to Soniox (transcription handled via callbacks)
                     try:
                         await asyncio.to_thread(stt_service.stream, resampled)
                     except Exception as e:
                         logger.error(f"⚠️ STT streaming error: {e}")
-                    
-                    # VAD processing
-                    vad_buffer += resampled
-                    while len(vad_buffer) >= VAD_MIN_BYTES:
-                        chunk = vad_buffer[:VAD_MIN_BYTES]
-                        vad_buffer = vad_buffer[VAD_MIN_BYTES:]
-                        confidence = vad_service.get_confidence(chunk)
-                        
-                        # Check for speech
-                        if confidence > vad_service.speech_threshold:
-                            # Interrupt TTS if playing
-                            if tts_task and not tts_task.done():
-                                logger.info("🛑 Interrupting TTS")
-                                tts_task.cancel()
-                                try:
-                                    await tts_task
-                                except asyncio.CancelledError:
-                                    pass
-                                tts_task = None
-                            
-                            # Clear old transcripts on new speech
-                            if not speaking:
-                                logger.info("🎤 New speech started")
-                                transcript_buffer.clear()
-                                waiting_for_transcript = False
-                            
-                            speaking = True
-                            silence_chunks = 0
-                        else:
-                            # Silence detected
-                            if speaking:
-                                silence_chunks += 1
-                        
-                        # Process after silence threshold
-                        if speaking and silence_chunks >= SILENCE_LIMIT_CHUNKS and not processing_llm:
-                            logger.info(f"🔕 Silence detected - Waiting for transcript...")
-                            speaking = False
-                            waiting_for_transcript = True
-                            
-                            if transcript_buffer:
-                                logger.info(f"📋 Transcript ready - Processing now!")
-                                waiting_for_transcript = False
-                                tts_task = asyncio.create_task(process_and_respond())
-                            
-                            # Reset silence_chunks to prevent infinite counting
-                            silence_chunks = 0
             
             # Handle stream stop
             elif event_type == "stop":
