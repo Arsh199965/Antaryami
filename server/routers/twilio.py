@@ -23,6 +23,7 @@ from services.call_analytics import CallAnalyticsService
 from db.connection import get_db
 from services.user_lookup import lookup_user_by_phone, get_user_id_from_phone
 from services.greeting_audio import get_greeting_mulaw_8k_chunks
+from services.wait_audio import get_wait_mulaw_8k_chunks
 from routers.agent import get_handoff_manager
 
 TTSLanguage = Literal["hi", "en", "auto"]
@@ -357,7 +358,30 @@ async def media_stream(ws: WebSocket):
             logger.info(f"📄 Processing: {full_transcript}")
             logger.info(f"📱 User ID: {user_id}, Is Twilio Call: {is_twilio_call}")
             
-            # Process with LLM - pass user_id and is_twilio_call context
+            # Step 1: Detect intent FIRST (fast operation)
+            logger.info("🔍 Detecting intent...")
+            intent_result = await llm_service.detect_intent(full_transcript)
+            detected_intent = intent_result.get("intent", "general")
+            requires_tools = intent_result.get("requires_tools", False)
+            logger.info(f"🎯 Intent: {detected_intent} (requires_tools: {requires_tools})")
+            
+            # Step 2: Play wait audio if intent requires tools (causes delay)
+            if requires_tools and stream_sid:
+                logger.info("⏳ Playing wait audio - tool processing expected...")
+                try:
+                    wait_chunks = get_wait_mulaw_8k_chunks()
+                    for payload_bytes in wait_chunks:
+                        payload = base64.b64encode(payload_bytes).decode('utf-8')
+                        await ws.send_json({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": payload}
+                        })
+                    logger.info("✅ Wait audio sent to Twilio")
+                except Exception as wait_err:
+                    logger.warning(f"⚠️ Failed to play wait audio: {wait_err}")
+            
+            # Step 3: Process with LLM - pass user_id and is_twilio_call context
             llm_result = await llm_service.process(
                 full_transcript, 
                 conversation_history,

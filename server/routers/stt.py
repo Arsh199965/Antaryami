@@ -17,6 +17,7 @@ from services.stt import STTService, VADService
 from services.llm import LLMService
 from services.tts import TTSService
 from services.call_analytics import CallAnalyticsService
+from services.wait_audio import get_wait_float32_44100_chunks, is_wait_audio_available
 from modules.config import ConfigEnv
 from modules.response.tool_registry import get_registry
 from db.connection import get_db
@@ -387,13 +388,32 @@ async def audio_websocket(ws: WebSocket):
             print(f"🔐 process_and_respond: user_id = {user_id}")
             print(f"📄 Processing transcript: {full_transcript}")
             
+            # Step 1: Detect intent FIRST (fast operation)
+            print("🔍 Detecting intent...")
+            intent_result = await llm_service.detect_intent(full_transcript)
+            detected_intent = intent_result.get("intent", "general")
+            requires_tools = intent_result.get("requires_tools", False)
+            print(f"🎯 Intent: {detected_intent} (requires_tools: {requires_tools})")
+            
+            # Step 2: Play wait audio if intent requires tools (causes delay)
+            if requires_tools:
+                print("⏳ Playing wait audio - tool processing expected...")
+                try:
+                    await ws.send_json({"type": "audio_start", "reason": "tool_processing"})
+                    for chunk in get_wait_float32_44100_chunks(chunk_size=4096):
+                        await ws.send_bytes(chunk)
+                    await ws.send_json({"type": "audio_end", "reason": "tool_processing"})
+                    print("✅ Wait audio played successfully")
+                except Exception as wait_err:
+                    print(f"⚠️ Failed to play wait audio: {wait_err}")
+            
             # Add user message to conversation history
             conversation_history.append({
                 "role": "user",
                 "text": full_transcript
             })
             
-            # Process with LLM pipeline (streaming)
+            # Step 3: Process with LLM pipeline (streaming)
             print(f"🤖 Calling LLM service (streaming) with conversation context ({len(conversation_history)} turns)...")
             print(f"🔑 user_id being passed to LLM: {user_id}")
             llm_result = await llm_service.process_stream(
@@ -403,7 +423,6 @@ async def audio_websocket(ws: WebSocket):
             )
 
             stream = llm_result.get("stream")
-            print(f"🎯 Intent: {llm_result.get('intent', {}).get('intent', 'unknown')}")
 
             # Extract tool names
             tool_calls_raw = llm_result.get('tool_calls', [])
