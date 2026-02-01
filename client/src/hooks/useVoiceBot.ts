@@ -26,6 +26,10 @@ const WS_BASE_URL = 'ws://localhost:8000/stt/ws/audio';
 const INPUT_SAMPLE_RATE = 16000;
 const OUTPUT_SAMPLE_RATE = 44100;
 
+// Audio buffer settings for smooth playback
+const AUDIO_BUFFER_SIZE = 8192; // Larger buffer for smoother playback
+const MIN_BUFFER_BEFORE_PLAY = 1; // Play immediately for real-time feel (was 3)
+
 export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn {
   const { token, userId } = options;
   
@@ -60,10 +64,13 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const audioQueueRef = useRef<Float32Array[]>([]);
   const isPlayingRef = useRef(false);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const sendIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const audioBufferRef = useRef<Float32Array>(new Float32Array(0));
+  const playbackScheduledTimeRef = useRef<number>(0);
 
   // Update call status helper
   const updateStatus = useCallback((status: CallStatus, error: string | null = null) => {
@@ -96,22 +103,53 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
     return int16.buffer;
   };
 
-  // Play audio from queue
+  // Play audio from queue with seamless scheduling
   const playAudioQueue = useCallback(async () => {
-    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
+    // If we are already running the scheduling loop, don't re-enter
+    if (isPlayingRef.current) return;
     
     isPlayingRef.current = true;
 
     try {
-      if (!outputAudioContextRef.current) {
+      if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
         outputAudioContextRef.current = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
       }
 
       const ctx = outputAudioContextRef.current;
       
+      // Resume context if suspended (browser autoplay policy)
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      
+      // Jitter buffer logic:
+      // Check if we are "starved" (last scheduled audio finished playing or is about to finish)
+      // tolerance of 0.05s handles slight timing variances
+      const isStarved = playbackScheduledTimeRef.current < ctx.currentTime + 0.05;
+
+      // If starved, ensure we have a minimum buffer before starting
+      // This prevents "stutter" if chunks arrive just barely in time
+      // If we are NOT starved (streaming smoothly), we play immediately to minimize latency
+      if (isStarved && audioQueueRef.current.length < MIN_BUFFER_BEFORE_PLAY) {
+         // Not enough to resume smoothly
+         isPlayingRef.current = false;
+         return;
+      }
+
+      // Initialize scheduled time if needed
+      // Always ensure we schedule in the future with a safety margin
+      // 0.03s (30ms) lookahead is enough for modern browsers and provides low latency
+      const minStartTime = ctx.currentTime + 0.03; 
+      if (playbackScheduledTimeRef.current < minStartTime) {
+        playbackScheduledTimeRef.current = minStartTime;
+      }
+
       while (audioQueueRef.current.length > 0) {
-        const audioData = audioQueueRef.current.shift();
-        if (!audioData) break;
+        const audioData = audioQueueRef.current[0]; // Peek first
+        if (!audioData || audioData.length === 0) {
+           audioQueueRef.current.shift();
+           continue;
+        }
 
         const audioBuffer = ctx.createBuffer(1, audioData.length, OUTPUT_SAMPLE_RATE);
         audioBuffer.copyToChannel(new Float32Array(audioData), 0);
@@ -120,10 +158,16 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
         source.buffer = audioBuffer;
         source.connect(ctx.destination);
 
-        await new Promise<void>((resolve) => {
-          source.onended = () => resolve();
-          source.start();
-        });
+        // Schedule this chunk to play
+        // Math.max ensures we don't schedule in the past which causes catch-up bursts
+        const startTime = playbackScheduledTimeRef.current;
+        source.start(startTime);
+        
+        // Remove from queue only after successful creation
+        audioQueueRef.current.shift();
+        
+        // Update scheduled time for next chunk
+        playbackScheduledTimeRef.current = startTime + audioBuffer.duration;
       }
     } catch (error) {
       console.error('Error playing audio:', error);
@@ -182,15 +226,36 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
+    
+    // Stop ScriptProcessor
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current = null;
+    }
+
+    if (mediaStreamSourceRef.current) {
+      mediaStreamSourceRef.current.disconnect();
+      mediaStreamSourceRef.current = null;
+    }
+    
+    // Close Input Audio Context
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close();
+      audioContextRef.current.close().catch(console.error);
       audioContextRef.current = null;
     }
-    if (audioProcessorRef.current) {
-      audioProcessorRef.current.disconnect();
-      audioProcessorRef.current = null;
+
+    // Close Output Audio Context
+    if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
+      outputAudioContextRef.current.close().catch(console.error);
+      outputAudioContextRef.current = null;
+    }
+
+    if (sendIntervalRef.current) {
+      clearInterval(sendIntervalRef.current);
+      sendIntervalRef.current = null;
     }
     analyserRef.current = null;
+    audioBufferRef.current = new Float32Array(0);
     setAudioLevel(0);
   }, []);
 
@@ -210,28 +275,39 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
     }
   }, []);
 
+  // Use ScriptProcessor for continuous audio capture (better than Analyser polling)
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
   // Setup audio processing to send to WebSocket
   const setupAudioProcessing = useCallback((stream: MediaStream) => {
     if (!audioContextRef.current) return;
 
     const ctx = audioContextRef.current;
-    const source = ctx.createMediaStreamSource(stream);
     
-    // Create processor (512 samples per chunk; downsampled to 16kHz before send)
-    const processor = ctx.createScriptProcessor(512, 1, 1);
-    audioProcessorRef.current = processor;
-
-    processor.onaudioprocess = (e) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN && !callState.isMuted) {
-        const inputData = e.inputBuffer.getChannelData(0);
-        const at16k = downsample(inputData, ctx.sampleRate, INPUT_SAMPLE_RATE);
-        const pcmData = float32ToInt16(at16k);
-        wsRef.current.send(pcmData);
-      }
-    };
-
+    // Create ScriptProcessor for capturing audio data
+    // Buffer size 4096 = ~85ms at 48kHz, ~92ms at 44.1kHz
+    const bufferSize = 4096;
+    const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
+    scriptProcessorRef.current = processor;
+    
+    const source = ctx.createMediaStreamSource(stream);
+    mediaStreamSourceRef.current = source;
+    
     source.connect(processor);
+    // Processor must be connected to destination to fire events, even if no output
     processor.connect(ctx.destination);
+    
+    processor.onaudioprocess = (e) => {
+      if (wsRef.current?.readyState !== WebSocket.OPEN || callState.isMuted) return;
+      
+      const inputData = e.inputBuffer.getChannelData(0);
+      
+      // Downsample to 16kHz
+      const at16k = downsample(inputData, ctx.sampleRate, INPUT_SAMPLE_RATE);
+      const pcmData = float32ToInt16(at16k);
+      
+      wsRef.current?.send(pcmData);
+    };
   }, [callState.isMuted]);
 
   // Update user location on backend (backend handles reverse geocoding)
@@ -345,8 +421,10 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
         if (event.data instanceof Blob) {
           const arrayBuffer = await event.data.arrayBuffer();
           const audioData = new Float32Array(arrayBuffer as ArrayBuffer);
-          audioQueueRef.current.push(audioData);
-          playAudioQueue();
+          if (audioData.length > 0) {
+            audioQueueRef.current.push(audioData);
+            playAudioQueue();
+          }
         } 
         // Handle JSON messages
         else if (typeof event.data === 'string') {
@@ -384,6 +462,8 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
               }
             } else if (data.type === 'audio_start') {
               console.log('🔊 Receiving TTS audio...');
+              // Reset playback scheduler for new audio stream
+              playbackScheduledTimeRef.current = 0;
             } else if (data.type === 'audio_end') {
               console.log('✅ TTS audio complete');
             } else if (data.type === 'interrupted') {
@@ -391,6 +471,7 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
               // Clear audio queue on interruption
               audioQueueRef.current = [];
               isPlayingRef.current = false;
+              playbackScheduledTimeRef.current = 0; // Reset scheduler
               setStreamingResponse('');  // Clear streaming response on interruption
               setIsNewSpeech(true);  // Ready for next speech
             } else if (data.type === 'handoff_queued') {
@@ -466,14 +547,15 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
 
     // Stop audio contexts
     stopAudioAnalysis();
-    if (outputAudioContextRef.current) {
+    if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
       outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
 
-    // Clear audio queue
+    // Clear audio queue and reset playback scheduler
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    playbackScheduledTimeRef.current = 0;
 
     // Stop duration timer
     stopDurationTimer();
@@ -513,9 +595,12 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
       }
+      if (sendIntervalRef.current) {
+        clearInterval(sendIntervalRef.current);
+      }
       stopAudioAnalysis();
       stopDurationTimer();
-      if (outputAudioContextRef.current) {
+      if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
         outputAudioContextRef.current.close();
       }
     };

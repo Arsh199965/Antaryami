@@ -6,8 +6,22 @@ import logging
 
 from modules.config import ConfigEnv
 from modules.response.response import ResponsePipeline
+from modules.response.intent_detector import IntentDetector
 
 logger = logging.getLogger(__name__)
+
+# Intents that typically require tool calls and may cause delay
+TOOL_HEAVY_INTENTS = {
+    "station_query",      # getNearestStation - DB query + distance calc
+    "battery_query",      # getBatteryInfo - DB query
+    "user_query",         # getUserInfo - DB query
+    "subscription_query", # getSubscriptionInfo - DB query
+    "swap_attempt_query", # getLastSwapAttempt - DB query
+    "service_center_query", # getLastServiceCenterVisit - DB query
+    "problem_report",     # reportBatteryIssue - DB write
+    "location_query",     # getCurrentLocation - DB query
+    "service_request",    # Multiple tools possible
+}
 
 
 # =========================
@@ -26,7 +40,44 @@ class LLMService:
             model_name=ConfigEnv.BEDROCK_MODEL_ID,
             temperature=ConfigEnv.BEDROCK_TEMPERATURE,
         )
+        self.intent_detector = IntentDetector(api_key=self.api_key)
         logger.info("✓ LLM Service initialized with response pipeline")
+    
+    async def detect_intent(self, transcript: str) -> dict:
+        """
+        Detect intent from transcript without full LLM processing.
+        
+        This is useful for early detection to play wait audio before
+        the full LLM processing starts.
+        
+        Args:
+            transcript: The transcribed text to analyze
+            
+        Returns:
+            Dictionary containing:
+            - intent: The detected intent category
+            - confidence: Confidence score
+            - reasoning: Explanation
+            - requires_tools: Whether this intent typically requires tool calls
+        """
+        try:
+            intent_result = await self.intent_detector.detect_intent(transcript)
+            detected_intent = intent_result.get("intent", "general")
+            
+            # Add flag indicating if this intent typically requires tools
+            intent_result["requires_tools"] = detected_intent in TOOL_HEAVY_INTENTS
+            
+            logger.info(f"Intent detected: {detected_intent} (requires_tools: {intent_result['requires_tools']})")
+            return intent_result
+            
+        except Exception as e:
+            logger.error(f"Error detecting intent: {e}")
+            return {
+                "intent": "general",
+                "confidence": 0.0,
+                "reasoning": f"Error: {str(e)}",
+                "requires_tools": False,
+            }
     
     async def process(
         self,
