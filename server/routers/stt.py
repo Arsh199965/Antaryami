@@ -406,12 +406,10 @@ async def audio_websocket(ws: WebSocket):
                     print("✅ Wait audio played successfully")
                 except Exception as wait_err:
                     print(f"⚠️ Failed to play wait audio: {wait_err}")
+            else:
+                print("⏩ Skipping wait audio - intent doesn't require tools")
             
-            # Add user message to conversation history
-            conversation_history.append({
-                "role": "user",
-                "text": full_transcript
-            })
+            # Note: User message was already added to conversation_history in finalize_utterance()
             
             # Step 3: Process with LLM pipeline (streaming)
             print(f"🤖 Calling LLM service (streaming) with conversation context ({len(conversation_history)} turns)...")
@@ -493,6 +491,11 @@ async def audio_websocket(ws: WebSocket):
             tts_context_id = f"tts-{uuid.uuid4()}"
             tts_started = False
             audio_chunk_count = 0
+            
+            # Text buffer for TTS - accumulates tokens to form sentences/phrases
+            # preventing tiny audio chunks and stuttering
+            tts_text_buffer = ""
+            MIN_TTS_CHUNK_SIZE = 50  # characters
 
             if stream:
                 async for text_chunk, is_last in stream_with_last(stream):
@@ -509,32 +512,63 @@ async def audio_websocket(ws: WebSocket):
                         "text": response_text.strip()
                     })
 
-                    if tts_service.enabled and text_chunk.strip():
-                        if not tts_started:
-                            await ws.send_json({"type": "audio_start"})
-                            tts_started = True
+                    if tts_service.enabled:
+                        tts_text_buffer += text_chunk
+                        
+                        # Determine if we should flush the buffer to TTS
+                        # Flush if:
+                        # 1. It's the last chunk
+                        # 2. Buffer ends with sentence-ending punctuation
+                        # 3. Buffer ends with phrase-ending punctuation AND is long enough
+                        # 4. Buffer is getting too long (> 200 chars)
+                        
+                        should_flush = is_last
+                        
+                        if not should_flush and tts_text_buffer.strip():
+                            stripped_buffer = tts_text_buffer.strip()
+                            ends_with_sentence = stripped_buffer[-1] in ".!?"
+                            ends_with_phrase = stripped_buffer[-1] in ",;:"
+                            length = len(stripped_buffer)
+                            
+                            if ends_with_sentence:
+                                should_flush = True
+                            elif ends_with_phrase and length > MIN_TTS_CHUNK_SIZE:
+                                should_flush = True
+                            elif length > 2 * MIN_TTS_CHUNK_SIZE: # Safety valve for long Run-on sentences
+                                should_flush = True
 
-                        try:
-                            tts_language = normalize_tts_language(detected_language)
-                            print(f"🔊 TTS using language: {tts_language} (detected: {detected_language})")
-                            async for audio_chunk in tts_service.stream_tts_chunk(
-                                transcript=text_chunk,
-                                context_id=tts_context_id,
-                                continue_flag=not is_last,
-                                language=tts_language,
-                            ):
-                                current_task = asyncio.current_task()
-                                if current_task and current_task.cancelled():
-                                    print("⚠️  TTS streaming interrupted")
-                                    await ws.send_json({"type": "interrupted"})
-                                    return
+                        if should_flush and tts_text_buffer.strip():
+                            text_to_speak = tts_text_buffer
+                            tts_text_buffer = "" # Clear buffer immediately
 
-                                await ws.send_bytes(audio_chunk)
-                                audio_chunk_count += 1
-                        except asyncio.CancelledError:
-                            print("⚠️  TTS streaming cancelled by interruption")
-                            await ws.send_json({"type": "interrupted"})
-                            raise
+                            if not tts_started:
+                                await ws.send_json({"type": "audio_start"})
+                                tts_started = True
+
+                            try:
+                                tts_language = normalize_tts_language(detected_language)
+                                # Only log reasonably sized chunks to avoid spam
+                                if len(text_to_speak) > 10:
+                                    print(f"🔊 TTS streaming chunk ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
+                                
+                                async for audio_chunk in tts_service.stream_tts_chunk(
+                                    transcript=text_to_speak,
+                                    context_id=tts_context_id,
+                                    continue_flag=not is_last,
+                                    language=tts_language,
+                                ):
+                                    current_task = asyncio.current_task()
+                                    if current_task and current_task.cancelled():
+                                        print("⚠️  TTS streaming interrupted")
+                                        await ws.send_json({"type": "interrupted"})
+                                        return
+
+                                    await ws.send_bytes(audio_chunk)
+                                    audio_chunk_count += 1
+                            except asyncio.CancelledError:
+                                print("⚠️  TTS streaming cancelled by interruption")
+                                await ws.send_json({"type": "interrupted"})
+                                raise
 
                 if tts_started:
                     await ws.send_json({"type": "audio_end"})
