@@ -495,7 +495,7 @@ async def audio_websocket(ws: WebSocket):
             # Text buffer for TTS - accumulates tokens to form sentences/phrases
             # preventing tiny audio chunks and stuttering
             tts_text_buffer = ""
-            MIN_TTS_CHUNK_SIZE = 50  # characters
+            MIN_TTS_CHUNK_SIZE = 20  # Lowered for faster time-to-first-audio (real-time feel)
 
             if stream:
                 async for text_chunk, is_last in stream_with_last(stream):
@@ -551,6 +551,10 @@ async def audio_websocket(ws: WebSocket):
                                 if len(text_to_speak) > 10:
                                     print(f"🔊 TTS streaming chunk ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
                                 
+                                # Buffer for audio output to avoid tiny websocket frames
+                                audio_output_buffer = bytearray()
+                                MIN_AUDIO_FRAME_SIZE = 4096  # ~4KB chunks (approx 23ms) for lower latency
+
                                 async for audio_chunk in tts_service.stream_tts_chunk(
                                     transcript=text_to_speak,
                                     context_id=tts_context_id,
@@ -563,8 +567,18 @@ async def audio_websocket(ws: WebSocket):
                                         await ws.send_json({"type": "interrupted"})
                                         return
 
-                                    await ws.send_bytes(audio_chunk)
+                                    audio_output_buffer.extend(audio_chunk)
+                                    
+                                    if len(audio_output_buffer) >= MIN_AUDIO_FRAME_SIZE:
+                                        await ws.send_bytes(audio_output_buffer)
+                                        audio_chunk_count += 1
+                                        audio_output_buffer = bytearray()
+                                
+                                # Flush remaining audio
+                                if len(audio_output_buffer) > 0:
+                                    await ws.send_bytes(audio_output_buffer)
                                     audio_chunk_count += 1
+                                    
                             except asyncio.CancelledError:
                                 print("⚠️  TTS streaming cancelled by interruption")
                                 await ws.send_json({"type": "interrupted"})

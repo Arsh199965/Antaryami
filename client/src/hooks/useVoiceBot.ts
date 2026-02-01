@@ -28,7 +28,7 @@ const OUTPUT_SAMPLE_RATE = 44100;
 
 // Audio buffer settings for smooth playback
 const AUDIO_BUFFER_SIZE = 8192; // Larger buffer for smoother playback
-const MIN_BUFFER_BEFORE_PLAY = 3; // Minimum chunks before starting playback
+const MIN_BUFFER_BEFORE_PLAY = 1; // Play immediately for real-time feel (was 3)
 
 export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn {
   const { token, userId } = options;
@@ -105,7 +105,8 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
 
   // Play audio from queue with seamless scheduling
   const playAudioQueue = useCallback(async () => {
-    if (isPlayingRef.current || audioQueueRef.current.length < MIN_BUFFER_BEFORE_PLAY) return;
+    // If we are already running the scheduling loop, don't re-enter
+    if (isPlayingRef.current) return;
     
     isPlayingRef.current = true;
 
@@ -121,9 +122,24 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
         await ctx.resume();
       }
       
+      // Jitter buffer logic:
+      // Check if we are "starved" (last scheduled audio finished playing or is about to finish)
+      // tolerance of 0.05s handles slight timing variances
+      const isStarved = playbackScheduledTimeRef.current < ctx.currentTime + 0.05;
+
+      // If starved, ensure we have a minimum buffer before starting
+      // This prevents "stutter" if chunks arrive just barely in time
+      // If we are NOT starved (streaming smoothly), we play immediately to minimize latency
+      if (isStarved && audioQueueRef.current.length < MIN_BUFFER_BEFORE_PLAY) {
+         // Not enough to resume smoothly
+         isPlayingRef.current = false;
+         return;
+      }
+
       // Initialize scheduled time if needed
-      // Always ensure we schedule in the future, even if we fell behind
-      const minStartTime = ctx.currentTime + 0.05; // 50ms min latency/lookahead
+      // Always ensure we schedule in the future with a safety margin
+      // 0.03s (30ms) lookahead is enough for modern browsers and provides low latency
+      const minStartTime = ctx.currentTime + 0.03; 
       if (playbackScheduledTimeRef.current < minStartTime) {
         playbackScheduledTimeRef.current = minStartTime;
       }
