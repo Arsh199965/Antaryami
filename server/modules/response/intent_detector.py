@@ -130,6 +130,8 @@ Only respond with the JSON object, no additional text."""
         try:
             prompt = self._get_intent_prompt(text)
             
+            logger.warning(f"🔥 LLM API CALL - IntentDetector.detect_intent")
+            
             response = await self.model.ainvoke(prompt)
             raw = response.content
             if isinstance(raw, list):

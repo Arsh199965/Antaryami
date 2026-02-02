@@ -3,17 +3,17 @@ TTS Service - Sarvam AI Streaming Text-to-Speech
 Uses Sarvam's bulbul:v2 model for high-quality Hindi/English TTS.
 
 Optimized for low latency with:
-- PCM output format (no decoding overhead)
+- WAV output format (reliable with SDK)
 - Small min_buffer_size for fast first audio
-- Direct sample rate output (no resampling needed)
+- NumPy-accelerated audio resampling
 - Persistent WebSocket connections for chunk streaming
 """
 import asyncio
 import base64
 import logging
-import struct
 from typing import AsyncGenerator, Literal, Optional, Dict, Any
 
+import numpy as np
 from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse
 
 from modules.config import ConfigEnv
@@ -92,7 +92,7 @@ class SarvamTTSService:
         """
         Convert PCM int16 audio to Float32 format with 2x upsampling.
         PCM LINEAR16 is raw int16 samples without any header.
-        Upsamples from 22050Hz to 44100Hz using linear interpolation.
+        Upsamples from 22050Hz to 44100Hz using NumPy vectorized operations.
         
         Args:
             pcm_data: Raw PCM int16 audio bytes (little-endian)
@@ -102,30 +102,27 @@ class SarvamTTSService:
         """
         if len(pcm_data) < 2:
             return b''
-            
-        # Number of int16 samples
-        num_samples = len(pcm_data) // 2
         
-        # Unpack int16 samples (little-endian)
-        int16_samples = struct.unpack(f'<{num_samples}h', pcm_data)
+        # Convert bytes to int16 array using NumPy (much faster than struct)
+        int16_samples = np.frombuffer(pcm_data, dtype=np.int16)
         
-        # Convert to float32 (normalize to -1.0 to 1.0 range)
-        float32_samples = [s / 32768.0 for s in int16_samples]
+        # Convert to float32 and normalize to -1.0 to 1.0 range
+        float32_samples = int16_samples.astype(np.float32) / 32768.0
         
         # Upsample 2x from 22050Hz to 44100Hz using linear interpolation
-        # This is a simple and efficient operation since it's exactly 2x
-        output_length = num_samples * 2
-        resampled = []
-        for i in range(num_samples):
-            sample = float32_samples[i]
-            next_sample = float32_samples[i + 1] if i + 1 < num_samples else sample
-            # Original sample
-            resampled.append(sample)
-            # Interpolated sample (midpoint)
-            resampled.append((sample + next_sample) * 0.5)
+        # Create interpolated samples (midpoints between consecutive samples)
+        # Shift array and compute midpoints: (samples[i] + samples[i+1]) / 2
+        midpoints = (float32_samples[:-1] + float32_samples[1:]) * 0.5
+        # Add last sample's midpoint (duplicate last sample)
+        midpoints = np.append(midpoints, float32_samples[-1])
         
-        # Pack as float32 little-endian
-        return struct.pack(f'<{len(resampled)}f', *resampled)
+        # Interleave original samples with midpoints
+        resampled = np.empty(len(float32_samples) * 2, dtype=np.float32)
+        resampled[0::2] = float32_samples  # Original samples at even indices
+        resampled[1::2] = midpoints  # Midpoints at odd indices
+        
+        # Return as bytes (already little-endian on most systems)
+        return resampled.tobytes()
     
     def _wav_to_float32(self, wav_data: bytes, is_first_chunk: bool = True) -> bytes:
         """

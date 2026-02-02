@@ -113,8 +113,9 @@ class ToolRegistry:
         
         tools = [self._to_langchain_tool(tool) for tool in tools_to_convert]
         logger.info(f"[ToolRegistry] Generated {len(tools)} LangChain tools")
+        # Log individual tools at DEBUG level to reduce noise
         for t in tools:
-            logger.info(f"[ToolRegistry] Tool '{t.name}': description='{t.description[:50]}...'")
+            logger.debug(f"[ToolRegistry] Tool '{t.name}': description='{t.description[:50]}...'")
         return tools
 
     @staticmethod

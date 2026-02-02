@@ -142,7 +142,7 @@ async def media_stream(ws: WebSocket):
     # Utterance accumulation state
     current_utterance_parts = []  # Accumulate transcripts from same utterance
     utterance_timer_task = None  # Timer to finalize utterance after pause
-    UTTERANCE_TIMEOUT = 1.0  # Seconds to wait before finalizing utterance
+    UTTERANCE_TIMEOUT = 0.4  # Seconds to wait before finalizing utterance (reduced for lower latency)
     
     # Get event loop for thread-safe task creation
     loop = asyncio.get_event_loop()
@@ -215,14 +215,15 @@ async def media_stream(ws: WebSocket):
             call_end_time = datetime.utcnow()
             duration_seconds = int((call_end_time - call_start_time).total_seconds())
             
-            logger.info(f"📊 Analyzing call transcript ({len(conversation_history)} messages)...")
+            logger.info(f"📊 Saving call transcript ({len(conversation_history)} messages) - analytics disabled")
             
-            # Generate AI insights
-            analysis = await analytics_service.analyze_call(conversation_history)
-            
-            logger.info(f"✅ Analysis complete:")
-            logger.info(f"   Summary: {analysis['summary'][:100]}...")
-            logger.info(f"   Satisfaction: {analysis['satisfaction_score']}/5 - {analysis['satisfaction_reasoning']}")
+            # Analytics disabled to reduce LLM API calls
+            # TODO: Re-enable when rate limits are increased
+            analysis = {
+                "summary": "Analytics disabled",
+                "satisfaction_score": 0,
+                "satisfaction_reasoning": "Analytics processing disabled"
+            }
             
             # Prepare call transcript document
             call_data = {
@@ -377,30 +378,7 @@ async def media_stream(ws: WebSocket):
             logger.info(f"📄 Processing: {full_transcript}")
             logger.info(f"📱 User ID: {user_id}, Is Twilio Call: {is_twilio_call}")
             
-            # Step 1: Detect intent FIRST (fast operation)
-            logger.info("🔍 Detecting intent...")
-            intent_result = await llm_service.detect_intent(full_transcript)
-            detected_intent = intent_result.get("intent", "general")
-            requires_tools = intent_result.get("requires_tools", False)
-            logger.info(f"🎯 Intent: {detected_intent} (requires_tools: {requires_tools})")
-            
-            # Step 2: Play wait audio if intent requires tools (causes delay)
-            if requires_tools and stream_sid:
-                logger.info("⏳ Playing wait audio - tool processing expected...")
-                try:
-                    wait_chunks = get_wait_mulaw_8k_chunks()
-                    for payload_bytes in wait_chunks:
-                        payload = base64.b64encode(payload_bytes).decode('utf-8')
-                        await ws.send_json({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": payload}
-                        })
-                    logger.info("✅ Wait audio sent to Twilio")
-                except Exception as wait_err:
-                    logger.warning(f"⚠️ Failed to play wait audio: {wait_err}")
-            
-            # Step 3: Process with LLM - pass user_id and is_twilio_call context
+            # Process with LLM - single call handles intent detection and tool selection
             llm_result = await llm_service.process(
                 full_transcript, 
                 conversation_history,

@@ -127,15 +127,17 @@ class LLMClient:
         try:
             tools = tool_schemas or []
             logger.info(f"[LLMClient] Number of tools available: {len(tools)}")
+            # Log individual tools at DEBUG level to reduce noise
             for t in tools:
-                logger.info(f"[LLMClient] Tool: {t.name} - {t.description[:50]}...")
+                logger.debug(f"[LLMClient] Tool: {t.name} - {t.description[:50]}...")
             
             llm = self.model.bind_tools(tools) if tools else self.model
 
             messages = self._build_messages(prompt, conversation_history)
             logger.info(f"[LLMClient] Messages to LLM: {[type(m).__name__ for m in messages]}")
+            # Log message contents at DEBUG level
             for m in messages:
-                logger.info(f"[LLMClient] {type(m).__name__}: {str(m.content)[:100]}...")
+                logger.debug(f"[LLMClient] {type(m).__name__}: {str(m.content)[:100]}...")
             
             response = await llm.ainvoke(messages)
             logger.info(f"[LLMClient] Response tool_calls: {response.tool_calls}")

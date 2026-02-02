@@ -172,7 +172,7 @@ async def audio_websocket(ws: WebSocket):
     # Utterance accumulation state
     current_utterance_parts = []  # Accumulate transcripts from same utterance
     utterance_timer_task = None  # Timer to finalize utterance after pause
-    UTTERANCE_TIMEOUT = 1.0  # Seconds to wait before finalizing utterance
+    UTTERANCE_TIMEOUT = 0.4  # Seconds to wait before finalizing utterance (reduced for lower latency)
     
     # Get event loop for scheduling tasks from callback thread
     loop = asyncio.get_event_loop()
@@ -195,14 +195,15 @@ async def audio_websocket(ws: WebSocket):
             call_end_time = datetime.utcnow()
             duration_seconds = int((call_end_time - call_start_time).total_seconds())
             
-            print(f"📊 Analyzing call transcript ({len(conversation_history)} messages)...")
+            print(f"📊 Saving call transcript ({len(conversation_history)} messages) - analytics disabled")
             
-            # Generate AI insights
-            analysis = await analytics_service.analyze_call(conversation_history)
-            
-            print(f"✅ Analysis complete:")
-            print(f"   Summary: {analysis['summary'][:100]}...")
-            print(f"   Satisfaction: {analysis['satisfaction_score']}/5 - {analysis['satisfaction_reasoning']}")
+            # Analytics disabled to reduce LLM API calls
+            # TODO: Re-enable when rate limits are increased
+            analysis = {
+                "summary": "Analytics disabled",
+                "satisfaction_score": 0,
+                "satisfaction_reasoning": "Analytics processing disabled"
+            }
             
             # Prepare call transcript document
             call_data = {
@@ -506,13 +507,82 @@ async def audio_websocket(ws: WebSocket):
             audio_chunk_count = 0
             
             # Text buffer for TTS - accumulates tokens to form sentences/phrases
-            # preventing tiny audio chunks and stuttering
             tts_text_buffer = ""
-            tts_queue = []  # Queue to hold TTS chunks for processing after LLM stream
-            MIN_TTS_CHUNK_SIZE = 20  # Lowered for faster time-to-first-audio (real-time feel)
+            MIN_TTS_CHUNK_SIZE = 20  # Lowered for faster time-to-first-audio
+            
+            # === PARALLEL TTS PIPELINE ===
+            # Use asyncio.Queue for parallel TTS processing while LLM streams
+            tts_queue: asyncio.Queue = asyncio.Queue()
+            tts_worker_task = None
+            tts_worker_error = None
+            
+            async def tts_worker():
+                """Background worker that processes TTS chunks in parallel with LLM streaming."""
+                nonlocal tts_started, audio_chunk_count, tts_worker_error
+                tts_language = normalize_tts_language(detected_language)
+                
+                while True:
+                    try:
+                        item = await tts_queue.get()
+                        
+                        # None signals end of queue
+                        if item is None:
+                            tts_queue.task_done()
+                            break
+                        
+                        text_to_speak = item["text"]
+                        is_last_tts = item["is_last"]
+                        
+                        # Check for user interruption
+                        if user_is_speaking:
+                            print("⚠️  User speaking during TTS - interrupting worker")
+                            tts_queue.task_done()
+                            break
+                        
+                        try:
+                            if len(text_to_speak) > 10:
+                                print(f"🔊 TTS parallel: ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
+                            
+                            # Buffer for audio output
+                            audio_output_buffer = bytearray()
+                            MIN_AUDIO_FRAME_SIZE = 4096
+                            
+                            async for audio_chunk in tts_service.stream_tts_chunk(
+                                transcript=text_to_speak,
+                                context_id=tts_context_id,
+                                continue_flag=not is_last_tts,
+                                language=tts_language,
+                            ):
+                                if user_is_speaking:
+                                    print("⚠️  User speaking - stopping TTS")
+                                    break
+                                
+                                audio_output_buffer.extend(audio_chunk)
+                                
+                                if len(audio_output_buffer) >= MIN_AUDIO_FRAME_SIZE:
+                                    await ws.send_bytes(bytes(audio_output_buffer))
+                                    audio_chunk_count += 1
+                                    audio_output_buffer = bytearray()
+                            
+                            # Flush remaining audio
+                            if len(audio_output_buffer) > 0:
+                                await ws.send_bytes(bytes(audio_output_buffer))
+                                audio_chunk_count += 1
+                                
+                        except asyncio.CancelledError:
+                            print("⚠️  TTS worker cancelled")
+                            raise
+                        except Exception as e:
+                            print(f"⚠️  TTS worker error: {e}")
+                            tts_worker_error = e
+                        
+                        tts_queue.task_done()
+                        
+                    except asyncio.CancelledError:
+                        break
 
             if stream:
-                print(f"📡 Starting LLM response stream...")
+                print(f"📡 Starting LLM response stream (with parallel TTS)...")
                 chunk_count = 0
                 async for text_chunk, is_last in stream_with_last(stream):
                     chunk_count += 1
@@ -521,12 +591,16 @@ async def audio_websocket(ws: WebSocket):
                     if current_task and current_task.cancelled():
                         print("⚠️  LLM streaming interrupted")
                         await ws.send_json({"type": "interrupted"})
+                        if tts_worker_task:
+                            tts_worker_task.cancel()
                         return
                     
                     # Check if user started speaking (interrupt)
                     if user_is_speaking:
                         print("⚠️  User is speaking - stopping LLM/TTS")
                         await ws.send_json({"type": "interrupted"})
+                        if tts_worker_task:
+                            tts_worker_task.cancel()
                         return
 
                     response_text += text_chunk
@@ -544,12 +618,6 @@ async def audio_websocket(ws: WebSocket):
                         tts_text_buffer += text_chunk
                         
                         # Determine if we should flush the buffer to TTS
-                        # Flush if:
-                        # 1. It's the last chunk
-                        # 2. Buffer ends with sentence-ending punctuation
-                        # 3. Buffer ends with phrase-ending punctuation AND is long enough
-                        # 4. Buffer is getting too long (> 200 chars)
-                        
                         should_flush = is_last
                         
                         if not should_flush and tts_text_buffer.strip():
@@ -562,90 +630,35 @@ async def audio_websocket(ws: WebSocket):
                                 should_flush = True
                             elif ends_with_phrase and length > MIN_TTS_CHUNK_SIZE:
                                 should_flush = True
-                            elif length > 2 * MIN_TTS_CHUNK_SIZE: # Safety valve for long Run-on sentences
+                            elif length > 2 * MIN_TTS_CHUNK_SIZE:
                                 should_flush = True
 
                         if should_flush and tts_text_buffer.strip():
                             text_to_speak = tts_text_buffer
-                            tts_text_buffer = "" # Clear buffer immediately
+                            tts_text_buffer = ""
 
+                            # Start TTS worker if not started
                             if not tts_started:
                                 await ws.send_json({"type": "audio_start"})
                                 tts_started = True
+                                tts_worker_task = asyncio.create_task(tts_worker())
 
-                            # Queue TTS work to be processed after LLM stream completes
-                            # This allows LLM to continue streaming without being blocked by TTS
-                            tts_queue.append({
+                            # Queue TTS work - worker processes in parallel
+                            await tts_queue.put({
                                 "text": text_to_speak,
                                 "is_last": is_last,
                             })
-
-                # After LLM stream completes, process TTS queue
-                if tts_service.enabled and tts_queue:
-                    tts_language = normalize_tts_language(detected_language)
-                    print(f"🔊 Processing {len(tts_queue)} TTS chunks...")
-                    
-                    for i, tts_item in enumerate(tts_queue):
-                        text_to_speak = tts_item["text"]
-                        is_last_tts = (i == len(tts_queue) - 1)
-                        
-                        # Check for interruption
-                        if user_is_speaking:
-                            print("⚠️  User speaking during TTS - interrupting")
-                            await ws.send_json({"type": "interrupted"})
-                            return
-                        
-                        current_task = asyncio.current_task()
-                        if current_task and current_task.cancelled():
-                            print("⚠️  TTS streaming interrupted")
-                            await ws.send_json({"type": "interrupted"})
-                            return
-                        
-                        try:
-                            if len(text_to_speak) > 10:
-                                print(f"🔊 TTS chunk {i+1}/{len(tts_queue)} ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
-                            
-                            # Buffer for audio output to avoid tiny websocket frames
-                            audio_output_buffer = bytearray()
-                            MIN_AUDIO_FRAME_SIZE = 4096  # ~4KB chunks (approx 23ms) for lower latency
-                            
-                            print(f"🔊 Starting TTS stream for chunk {i+1}...")
-
-                            async for audio_chunk in tts_service.stream_tts_chunk(
-                                transcript=text_to_speak,
-                                context_id=tts_context_id,
-                                continue_flag=not is_last_tts,
-                                language=tts_language,
-                            ):
-                                print(f"🔊 Received audio chunk: {len(audio_chunk)} bytes")
-                                # Check for user interruption during TTS
-                                if user_is_speaking:
-                                    print("⚠️  User speaking during TTS - interrupting")
-                                    await ws.send_json({"type": "interrupted"})
-                                    return
-                                
-                                current_task = asyncio.current_task()
-                                if current_task and current_task.cancelled():
-                                    print("⚠️  TTS streaming interrupted")
-                                    await ws.send_json({"type": "interrupted"})
-                                    return
-
-                                audio_output_buffer.extend(audio_chunk)
-                                
-                                if len(audio_output_buffer) >= MIN_AUDIO_FRAME_SIZE:
-                                    await ws.send_bytes(audio_output_buffer)
-                                    audio_chunk_count += 1
-                                    audio_output_buffer = bytearray()
-                            
-                            # Flush remaining audio
-                            if len(audio_output_buffer) > 0:
-                                await ws.send_bytes(audio_output_buffer)
-                                audio_chunk_count += 1
-                                
-                        except asyncio.CancelledError:
-                            print("⚠️  TTS streaming cancelled by interruption")
-                            await ws.send_json({"type": "interrupted"})
-                            raise
+                
+                # Signal end of TTS queue and wait for worker to finish
+                if tts_worker_task:
+                    await tts_queue.put(None)  # Signal end
+                    try:
+                        await asyncio.wait_for(tts_worker_task, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        print("⚠️  TTS worker timeout, cancelling")
+                        tts_worker_task.cancel()
+                    except asyncio.CancelledError:
+                        pass
 
                 if tts_started:
                     await ws.send_json({"type": "audio_end"})
