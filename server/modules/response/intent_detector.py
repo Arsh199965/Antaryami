@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
-from langchain_aws import ChatBedrockConverse
+from langchain_cerebras import ChatCerebras
 
 from modules.config import ConfigEnv
 
@@ -33,22 +33,20 @@ class IntentDetector:
         Initialize the intent detector.
         
         Args:
-            api_key: Unused for Bedrock. Present for backward compatibility.
-            region_name: AWS region. If not provided, reads from BEDROCK_REGION or AWS_REGION.
+            api_key: Cerebras API key. If not provided, reads from CEREBRAS_API_KEY env var.
+            region_name: Unused. Present for backward compatibility.
         """
-        self.api_key = api_key
-        # Use same Bedrock model as pipeline; GEMINI_MODEL_NAME kept for override
-        self.model_name = ConfigEnv.BEDROCK_MODEL_ID
+        self.api_key = api_key or ConfigEnv.CEREBRAS_API_KEY
+        if not self.api_key:
+            raise ValueError("CEREBRAS_API_KEY must be set in environment variables")
+        self.model_name = ConfigEnv.CEREBRAS_MODEL_ID
         if not self.model_name:
-            raise ValueError(
-                "Set BEDROCK_MODEL_ID or GEMINI_MODEL_NAME in environment variables"
-            )
-        self.region_name = region_name or ConfigEnv.get_bedrock_region()
-        self.model = ChatBedrockConverse(
+            raise ValueError("CEREBRAS_MODEL_ID must be set in environment variables")
+        self.model = ChatCerebras(
             model=self.model_name,
+            api_key=self.api_key,
             temperature=0,
             max_tokens=512,
-            region_name=self.region_name,
         )
 
     def _get_intent_prompt(self, text: str) -> str:

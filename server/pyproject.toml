@@ -32,4 +32,6 @@ dependencies = [
     "motor>=3.6.0",
     "openpyxl>=3.1.0",
     "pinecone>=5.0.0",
+    "langchain-cerebras>=0.8.2",
+    "sarvamai>=0.1.22",
 ]

@@ -1,6 +1,6 @@
 """Integration tests for end-to-end pipeline functionality.
 
-Note: These tests require valid AWS credentials to run actual Bedrock API calls.
+Note: These tests require a valid Cerebras API key to run actual API calls.
 """
 
 from pathlib import Path
@@ -15,26 +15,25 @@ if env_path.exists():
 from modules.config import ConfigEnv
 
 # Skip integration tests if no real API key is available
-_has_aws_credentials = bool(
-    ConfigEnv.AWS_ACCESS_KEY_ID
-    and ConfigEnv.AWS_SECRET_ACCESS_KEY
-    and ConfigEnv.get_bedrock_region()
+_has_cerebras_credentials = bool(
+    ConfigEnv.CEREBRAS_API_KEY
+    and ConfigEnv.CEREBRAS_MODEL_ID
 )
 
 pytestmark = pytest.mark.skipif(
-    not _has_aws_credentials,
-    reason="Integration tests skipped. Set AWS credentials and BEDROCK_REGION/AWS_REGION in .env file to run.",
+    not _has_cerebras_credentials,
+    reason="Integration tests skipped. Set CEREBRAS_API_KEY and CEREBRAS_MODEL_ID in .env file to run.",
 )
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_full_pipeline_with_real_api():
-    """Test full pipeline with real Bedrock API (requires AWS credentials)."""
+    """Test full pipeline with real Cerebras API (requires CEREBRAS_API_KEY)."""
     from modules.response.response import ResponsePipeline
 
-    if not _has_aws_credentials:
-        pytest.skip("AWS credentials not set")
+    if not _has_cerebras_credentials:
+        pytest.skip("Cerebras API key not set")
 
     pipeline = ResponsePipeline()
     

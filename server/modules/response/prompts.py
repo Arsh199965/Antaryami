@@ -104,14 +104,27 @@ def build_system_prompt(
     # Response guidelines
     prompt_parts.append(
         "\n\nRESPONSE GUIDELINES:"
-        "\n- Be concise and helpful."
+        "\n- CRITICAL: Keep responses SHORT and CONCISE (2-3 sentences max for simple queries)."
+        "\n- This is a VOICE conversation - speak naturally, not like reading documentation."
+        "\n- LANGUAGE MATCHING: Match the user's language in your response:"
+        "\n  - If user speaks in Hindi (Devanagari or Hinglish), respond in Hindi using Devanagari script (देवनागरी)."
+        "\n  - If user speaks in English, respond in English."
+        "\n  - For mixed input (Hinglish), prefer responding in Hindi Devanagari script."
+        "\n  - Example: User says 'मेरी battery की health कैसी है?' → Respond: 'आपकी बैटरी 85% healthy है।'"
+        "\n- Avoid long lists, bullet points, or detailed explanations unless specifically asked."
+        "\n- Get to the point quickly - users are speaking, not reading."
         "\n- If you need to use a tool to answer, use it before responding."
-        "\n- After receiving tool results, incorporate the information naturally into your response."
+        "\n- After receiving tool results, summarize the key info briefly."
         "\n- Don't mention that you're using tools; just provide the information."
         "\n- IMPORTANT: When a complaint/issue is reported using reportBatteryIssue tool:"
         "\n  1. FIRST confirm that the complaint has been registered/recorded"
-        "\n  2. THEN provide any safety advice or next steps"
-        "\n  3. Example: 'Your complaint has been registered. [Then safety advice if applicable]'"
+        "\n  2. THEN provide brief safety advice if needed"
+        "\n  3. Example: 'आपकी complaint register हो गई है। Safety के लिए battery use मत करो।'"
+        "\n- Examples of good concise responses:"
+        "\n  - User: 'Nearest station?' → 'आपके पास XYZ station है, 500 meter दूर।'"
+        "\n  - User: 'Battery health?' → 'आपकी battery 85% healthy है, charging properly।'"
+        "\n  - User: 'नमस्ते' → 'नमस्ते! मैं आपकी कैसे मदद कर सकता हूं?'"
+        "\n  - User: 'Hi' → 'Hello! How can I help you?'"
     )
     
     return "\n".join(prompt_parts)

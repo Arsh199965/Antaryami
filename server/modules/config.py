@@ -37,6 +37,12 @@ class ConfigEnv:
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
+    # ----- Cerebras -----
+    CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+    CEREBRAS_MODEL_ID = os.getenv("CEREBRAS_MODEL_ID", "llama3.1-70b")  # Default to 70b if not set
+    CEREBRAS_TEMPERATURE = convert_to_float(os.getenv("CEREBRAS_TEMPERATURE", "0.7")) or 0.7
+    CEREBRAS_MAX_TOKENS = convert_to_int(os.getenv("CEREBRAS_MAX_TOKENS"))
+
     # ----- Cartesia -----
     CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
     CARTESIAN_PRODUCT_API_KEY = os.getenv("CARTESIAN_PRODUCT_API_KEY")
@@ -66,7 +72,8 @@ class ConfigEnv:
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY")
 
     # ----- STT -----
-    SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+    SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")  # Legacy, kept for reference
     ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 
     # ----- Feature flags -----

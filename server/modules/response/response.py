@@ -35,9 +35,9 @@ class ResponsePipeline:
             model_name: Name of the Bedrock model. If not provided, reads from BEDROCK_MODEL_ID env var.
             temperature: Sampling temperature for LLM.
         """
-        _model_name = model_name or ConfigEnv.BEDROCK_MODEL_ID
+        _model_name = model_name or ConfigEnv.CEREBRAS_MODEL_ID
         if not _model_name:
-            raise ValueError("BEDROCK_MODEL_ID must be set in environment variables or provided")
+            raise ValueError("CEREBRAS_MODEL_ID must be set in environment variables or provided")
         self.intent_detector = IntentDetector(api_key=api_key)
         self.llm_client = LLMClient(
             api_key=api_key,
@@ -227,6 +227,7 @@ class ResponsePipeline:
         conversation_history: list = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
+        pre_detected_intent: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Process text and stream the final LLM response.
@@ -236,6 +237,7 @@ class ResponsePipeline:
             conversation_history: Previous conversation for context.
             user_id: Optional; used for tool calls requiring user identification.
             is_twilio_call: Whether this is a Twilio phone call (no GPS available).
+            pre_detected_intent: Optional; pre-detected intent to skip redundant detection.
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
@@ -244,9 +246,12 @@ class ResponsePipeline:
             logger.info(f"Processing text (streaming): {text[:100]}...")
             logger.info(f"[Pipeline] user_id received: {user_id}, is_twilio_call: {is_twilio_call}")
 
-            # Step 1: Intent Detection (optional for streaming latency)
-            intent_detection_enabled = ConfigEnv.INTENT_DETECTION_ENABLED
-            if intent_detection_enabled:
+            # Step 1: Intent Detection (skip if already provided)
+            if pre_detected_intent:
+                logger.info("Step 1: Intent Detection (using pre-detected intent)")
+                intent_result = pre_detected_intent
+                logger.info(f"Pre-detected intent: {intent_result.get('intent')}")
+            elif ConfigEnv.INTENT_DETECTION_ENABLED:
                 logger.info("Step 1: Intent Detection")
                 intent_result = await self.intent_detector.detect_intent(text)
                 logger.info(f"Detected intent: {intent_result.get('intent')}")
@@ -271,11 +276,19 @@ class ResponsePipeline:
             tool_conversation = [{"role": "system", "content": system_prompt}]
             tool_conversation.extend(conversation_history or [])
 
-            llm_response = await self.llm_client.generate_with_tools(
-                prompt=text,
-                tool_schemas=langchain_tools,
-                conversation_history=tool_conversation,
-            )
+            logger.info(f"[Pipeline] Calling LLM generate_with_tools...")
+            try:
+                llm_response = await self.llm_client.generate_with_tools(
+                    prompt=text,
+                    tool_schemas=langchain_tools,
+                    conversation_history=tool_conversation,
+                )
+                logger.info(f"[Pipeline] LLM generate_with_tools completed. Tool calls: {len(llm_response.get('tool_calls', []))}")
+            except Exception as llm_err:
+                logger.error(f"[Pipeline] LLM generate_with_tools FAILED: {llm_err}")
+                import traceback
+                traceback.print_exc()
+                raise
 
             # Step 3: Tool Execution (if LLM requested tools) — run in parallel
             tool_results = []

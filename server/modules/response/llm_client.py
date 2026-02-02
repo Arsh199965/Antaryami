@@ -1,4 +1,4 @@
-"""LLM client for LangChain AWS Bedrock with tool calling support."""
+"""LLM client for LangChain Cerebras with tool calling support."""
 
 import json
 import logging
@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional, AsyncGenerator
 from datetime import datetime
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_aws import ChatBedrockConverse
+from langchain_cerebras import ChatCerebras
 
 from modules.config import ConfigEnv
 
@@ -27,7 +27,7 @@ def serialize_for_json(obj: Any) -> Any:
 
 
 class LLMClient:
-    """Client for interacting with AWS Bedrock via LangChain."""
+    """Client for interacting with Cerebras via LangChain."""
     
     def __init__(
         self,
@@ -35,31 +35,32 @@ class LLMClient:
         model_name: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        region_name: Optional[str] = None,
+        region_name: Optional[str] = None,  # Kept for backward compatibility, unused
     ):
         """
         Initialize the LLM client.
         
         Args:
-            api_key: Unused for Bedrock. Present for backward compatibility.
-            model_name: Name of the Bedrock model. If not provided, reads from BEDROCK_MODEL_ID env var.
+            api_key: Cerebras API key. If not provided, reads from CEREBRAS_API_KEY env var.
+            model_name: Name of the Cerebras model. If not provided, reads from CEREBRAS_MODEL_ID env var.
             temperature: Sampling temperature (0.0 to 1.0).
             max_tokens: Maximum number of tokens in response.
-            region_name: AWS region. If not provided, reads from BEDROCK_REGION or AWS_REGION.
+            region_name: Unused. Present for backward compatibility.
         """
-        self.api_key = api_key
-        self.model_name = model_name or ConfigEnv.BEDROCK_MODEL_ID
+        self.api_key = api_key or ConfigEnv.CEREBRAS_API_KEY
+        if not self.api_key:
+            raise ValueError("CEREBRAS_API_KEY must be set in environment variables or provided")
+        self.model_name = model_name or ConfigEnv.CEREBRAS_MODEL_ID
         if not self.model_name:
-            raise ValueError("BEDROCK_MODEL_ID must be set in environment variables or provided")
+            raise ValueError("CEREBRAS_MODEL_ID must be set in environment variables or provided")
         self.temperature = temperature
-        self.max_tokens = max_tokens or ConfigEnv.BEDROCK_MAX_TOKENS
-        self.region_name = region_name or ConfigEnv.get_bedrock_region()
+        self.max_tokens = max_tokens or ConfigEnv.CEREBRAS_MAX_TOKENS
 
-        self.model = ChatBedrockConverse(
+        self.model = ChatCerebras(
             model=self.model_name,
+            api_key=self.api_key,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            region_name=self.region_name,
         )
 
     def _build_messages(

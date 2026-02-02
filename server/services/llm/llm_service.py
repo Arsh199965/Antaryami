@@ -32,16 +32,15 @@ class LLMService:
 
     def __init__(self):
         """Initialize LLM service with response pipeline"""
-        self.api_key = ConfigEnv.BEDROCK_API_KEY
-        # Bedrock uses AWS credentials; keep api_key for backward compatibility only
+        self.api_key = ConfigEnv.CEREBRAS_API_KEY
 
         self.pipeline = ResponsePipeline(
             api_key=self.api_key,
-            model_name=ConfigEnv.BEDROCK_MODEL_ID,
-            temperature=ConfigEnv.BEDROCK_TEMPERATURE,
+            model_name=ConfigEnv.CEREBRAS_MODEL_ID,
+            temperature=ConfigEnv.CEREBRAS_TEMPERATURE,
         )
         self.intent_detector = IntentDetector(api_key=self.api_key)
-        logger.info("✓ LLM Service initialized with response pipeline")
+        logger.info("✓ LLM Service initialized with Cerebras response pipeline")
     
     async def detect_intent(self, transcript: str) -> dict:
         """
@@ -142,6 +141,7 @@ class LLMService:
         conversation_history: list = None,
         user_id: str | None = None,
         is_twilio_call: bool = False,
+        pre_detected_intent: dict | None = None,
     ) -> dict:
         """
         Process transcript and stream the LLM response.
@@ -151,6 +151,7 @@ class LLMService:
             conversation_history: Previous conversation turns for context
             user_id: Optional; used for tool calls requiring user identification
             is_twilio_call: Whether this is a Twilio phone call (no GPS available)
+            pre_detected_intent: Optional; pre-detected intent to skip redundant detection
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
@@ -164,6 +165,7 @@ class LLMService:
                 conversation_history,
                 user_id=user_id,
                 is_twilio_call=is_twilio_call,
+                pre_detected_intent=pre_detected_intent,
             )
             return result
         except Exception as e:

@@ -4,7 +4,7 @@ import logging
 from typing import Dict, Any, Optional
 from enum import Enum
 
-from langchain_aws import ChatBedrockConverse
+from langchain_cerebras import ChatCerebras
 
 from modules.config import ConfigEnv
 
@@ -117,19 +117,19 @@ class BatteryIssueClassifier:
     
     def __init__(self):
         """Initialize the classifier."""
-        self.model_name = ConfigEnv.BEDROCK_MODEL_ID or "anthropic.claude-3-haiku-20240307-v1:0"
-        self.region_name = ConfigEnv.get_bedrock_region()
-        self._llm: Optional[ChatBedrockConverse] = None
+        self.api_key = ConfigEnv.CEREBRAS_API_KEY
+        self.model_name = ConfigEnv.CEREBRAS_MODEL_ID or "llama-3.3-70b"
+        self._llm: Optional[ChatCerebras] = None
     
     @property
-    def llm(self) -> ChatBedrockConverse:
+    def llm(self) -> ChatCerebras:
         """Lazy load LLM."""
         if self._llm is None:
-            self._llm = ChatBedrockConverse(
+            self._llm = ChatCerebras(
                 model=self.model_name,
+                api_key=self.api_key,
                 temperature=0,
                 max_tokens=512,
-                region_name=self.region_name,
             )
         return self._llm
     

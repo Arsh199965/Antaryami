@@ -4,7 +4,7 @@ Call Analytics Service - Generate summaries and satisfaction scores for call tra
 import logging
 from typing import Dict, Any, List
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_aws import ChatBedrockConverse
+from langchain_cerebras import ChatCerebras
 from modules.config import ConfigEnv
 
 logger = logging.getLogger(__name__)
@@ -15,11 +15,11 @@ class CallAnalyticsService:
     
     def __init__(self):
         """Initialize the analytics service with LLM."""
-        self.model = ChatBedrockConverse(
-            model="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        self.model = ChatCerebras(
+            model=ConfigEnv.CEREBRAS_MODEL_ID or "llama-3.3-70b",
+            api_key=ConfigEnv.CEREBRAS_API_KEY,
             temperature=0.3,  # Lower temperature for more consistent analysis
             max_tokens=1024,
-            region_name=ConfigEnv.AWS_REGION or "us-east-1",
         )
     
     async def analyze_call(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:

@@ -353,6 +353,41 @@ async def audio_websocket(ws: WebSocket):
         
         loop.call_soon_threadsafe(schedule_timer)
     
+    # Track if user is speaking (for interruption during TTS)
+    user_is_speaking = False
+    
+    def on_speech_start():
+        """Handle speech start event from Sarvam VAD"""
+        nonlocal user_is_speaking, tts_task
+        user_is_speaking = True
+        print("🎤 VAD: User started speaking")
+        
+        # Send to frontend for UI update
+        async def notify_frontend():
+            await ws.send_json({"type": "speech_start"})
+            
+            # Cancel TTS if user interrupts
+            if tts_task and not tts_task.done():
+                print("🛑 Interrupting TTS - User is speaking")
+                tts_task.cancel()
+                try:
+                    await ws.send_json({"type": "interrupted"})
+                except:
+                    pass
+        
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(notify_frontend()))
+    
+    def on_speech_end():
+        """Handle speech end event from Sarvam VAD"""
+        nonlocal user_is_speaking
+        user_is_speaking = False
+        print("🔇 VAD: User stopped speaking")
+        
+        # Send to frontend for UI update
+        async def notify_frontend():
+            await ws.send_json({"type": "speech_end"})
+        
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(notify_frontend()))
 
     def on_error(error: str):
         print(f"❌ STT Error: {error}")
@@ -360,12 +395,14 @@ async def audio_websocket(ws: WebSocket):
     stt_service = STTService(
         on_transcript=on_transcript,
         on_partial_transcript=on_partial_transcript,
-        on_error=on_error
+        on_error=on_error,
+        on_speech_start=on_speech_start,
+        on_speech_end=on_speech_end
     )
     
-    # Connect to Soniox
+    # Connect to Sarvam AI
     await asyncio.to_thread(stt_service.connect)
-    print("🎙️  Connected to Soniox - Ready to receive audio")
+    print("🎙️  Connected to Sarvam AI - Ready to receive audio")
 
     # Play greeting audio (float32 44100 Hz) at call start
     await ws.send_json({"type": "audio_start"})
@@ -375,7 +412,7 @@ async def audio_websocket(ws: WebSocket):
 
     async def process_and_respond():
         """Process transcript with LLM and stream TTS response"""
-        nonlocal tts_task, user_id, conversation_history, handoff_session_id, is_agent_connected
+        nonlocal tts_task, user_id, conversation_history, handoff_session_id, is_agent_connected, user_is_speaking
         
         # Use lock to prevent concurrent processing
         async with processing_lock:
@@ -418,6 +455,7 @@ async def audio_websocket(ws: WebSocket):
                 full_transcript,
                 conversation_history,
                 user_id=user_id,
+                pre_detected_intent=intent_result,  # Pass pre-detected intent to avoid redundant detection
             )
 
             stream = llm_result.get("stream")
@@ -499,10 +537,16 @@ async def audio_websocket(ws: WebSocket):
 
             if stream:
                 async for text_chunk, is_last in stream_with_last(stream):
-                    # Check for interruption
+                    # Check for interruption (user speaking or task cancelled)
                     current_task = asyncio.current_task()
                     if current_task and current_task.cancelled():
                         print("⚠️  LLM streaming interrupted")
+                        await ws.send_json({"type": "interrupted"})
+                        return
+                    
+                    # Check if user started speaking (interrupt)
+                    if user_is_speaking:
+                        print("⚠️  User is speaking - stopping LLM/TTS")
                         await ws.send_json({"type": "interrupted"})
                         return
 
@@ -561,6 +605,12 @@ async def audio_websocket(ws: WebSocket):
                                     continue_flag=not is_last,
                                     language=tts_language,
                                 ):
+                                    # Check for user interruption during TTS
+                                    if user_is_speaking:
+                                        print("⚠️  User speaking during TTS - interrupting")
+                                        await ws.send_json({"type": "interrupted"})
+                                        return
+                                    
                                     current_task = asyncio.current_task()
                                     if current_task and current_task.cancelled():
                                         print("⚠️  TTS streaming interrupted")
@@ -670,9 +720,9 @@ async def audio_websocket(ws: WebSocket):
         # Cleanup
         try:
             await asyncio.to_thread(stt_service.disconnect)
-            print("🔌 Disconnected from Soniox")
+            print("🔌 Disconnected from Sarvam AI")
         except Exception as e:
-            print(f"⚠️  Error disconnecting from Soniox: {e}")
+            print(f"⚠️  Error disconnecting from Sarvam AI: {e}")
 
 
 # =========================

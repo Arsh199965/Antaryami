@@ -19,10 +19,12 @@ if not os.getenv("GEMINI_API_KEY"):
     os.environ["GEMINI_API_KEY"] = "test_api_key_12345"
 if not os.getenv("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY", "test_api_key_12345")
-if not os.getenv("BEDROCK_MODEL_ID"):
-    os.environ["BEDROCK_MODEL_ID"] = "anthropic.claude-3-haiku-20240307-v1:0"
+if not os.getenv("CEREBRAS_API_KEY"):
+    os.environ["CEREBRAS_API_KEY"] = "test_cerebras_api_key_12345"
+if not os.getenv("CEREBRAS_MODEL_ID"):
+    os.environ["CEREBRAS_MODEL_ID"] = "llama-3.3-70b"
 if not os.getenv("GEMINI_MODEL_NAME"):
-    os.environ["GEMINI_MODEL_NAME"] = "anthropic.claude-3-haiku-20240307-v1:0"
+    os.environ["GEMINI_MODEL_NAME"] = "llama-3.3-70b"
 
 from modules.config import ConfigEnv
 
