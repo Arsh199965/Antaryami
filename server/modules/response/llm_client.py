@@ -67,6 +67,7 @@ class LLMClient:
         self,
         prompt: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        skip_prompt_append: bool = False,
     ) -> List[BaseMessage]:
         messages: List[BaseMessage] = []
 
@@ -81,7 +82,13 @@ class LLMClient:
                 elif role == "user":
                     messages.append(HumanMessage(content=content))
 
-        messages.append(HumanMessage(content=prompt))
+        # Only append prompt if not already the last message and not skipped
+        if not skip_prompt_append:
+            # Check if the prompt is already the last message
+            if messages and isinstance(messages[-1], HumanMessage) and messages[-1].content == prompt:
+                pass  # Skip, prompt already in conversation_history
+            else:
+                messages.append(HumanMessage(content=prompt))
         return messages
 
     @staticmethod

@@ -4,7 +4,6 @@ import pytest
 from modules.config import ConfigEnv
 from modules.response.response import ResponsePipeline
 from modules.response.llm_client import LLMClient
-from modules.response.intent_detector import IntentDetector
 
 
 @pytest.mark.asyncio
@@ -14,7 +13,6 @@ async def test_pipeline_initialization():
     
     assert pipeline is not None
     assert pipeline.llm_client is not None
-    assert pipeline.intent_detector is not None
     assert pipeline.tool_registry is not None
 
 
@@ -28,17 +26,6 @@ async def test_llm_client_initialization():
     assert client.model_name == ConfigEnv.CEREBRAS_MODEL_ID
     assert client.temperature == 0.7
     assert client.model is not None
-
-
-@pytest.mark.asyncio
-async def test_intent_detector_initialization():
-    """Test intent detector initialization."""
-    detector = IntentDetector(api_key="test_api_key")
-    
-    assert detector is not None
-    assert detector.api_key == "test_api_key"
-    assert detector.model is not None
-    assert len(detector.INTENT_CATEGORIES) > 0
 
 
 def test_pipeline_load_test_prompts():
@@ -56,7 +43,6 @@ async def test_pipeline_process_text_structure(mock_langchain_chat_model, monkey
     """Test that process_text returns correct structure."""
     # Mock the ChatCerebras to avoid actual API calls
     monkeypatch.setattr("modules.response.llm_client.ChatCerebras", lambda **kwargs: mock_langchain_chat_model)
-    monkeypatch.setattr("modules.response.intent_detector.ChatCerebras", lambda **kwargs: mock_langchain_chat_model)
     
     pipeline = ResponsePipeline(api_key="test_api_key")
     result = await pipeline.process_text("Test prompt")
@@ -64,7 +50,6 @@ async def test_pipeline_process_text_structure(mock_langchain_chat_model, monkey
     # Check structure of result
     assert isinstance(result, dict)
     assert "response" in result
-    assert "intent" in result
     assert "tool_calls" in result
     assert "tool_results" in result
     assert "metadata" in result

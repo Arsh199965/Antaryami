@@ -1,4 +1,8 @@
 """TTS Services"""
-from .tts_service import TTSService
+from .sarvam_tts_service import SarvamTTSService, get_sarvam_tts_service
 
-__all__ = ["TTSService"]
+# Default TTS service is now Sarvam
+TTSService = SarvamTTSService
+get_tts_service = get_sarvam_tts_service
+
+__all__ = ["TTSService", "SarvamTTSService", "get_tts_service", "get_sarvam_tts_service"]

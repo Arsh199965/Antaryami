@@ -1,16 +1,12 @@
-"""Main response pipeline orchestrator."""
+"""Main response pipeline orchestrator - simplified single LLM call approach."""
 
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional, AsyncGenerator
-import uuid
-from datetime import datetime, timezone
+from typing import Dict, Any, Optional
 from pathlib import Path
 
-from db.connection import get_db
 from modules.config import ConfigEnv
-from .intent_detector import IntentDetector
 from .llm_client import LLMClient
 from .tool_registry import get_registry
 from .prompts import build_system_prompt
@@ -19,7 +15,15 @@ logger = logging.getLogger(__name__)
 
 
 class ResponsePipeline:
-    """Main pipeline for processing text through intent detection, LLM, and tool calls."""
+    """
+    Simplified pipeline for processing text through LLM with tools.
+    
+    Flow:
+    1. Build system prompt with all tools
+    2. Single LLM call (LLM decides which tools to use)
+    3. Execute tools if requested
+    4. Generate/stream final response
+    """
     
     def __init__(
         self,
@@ -31,44 +35,36 @@ class ResponsePipeline:
         Initialize the response pipeline.
         
         Args:
-            api_key: Google Gemini API key.
-            model_name: Name of the Bedrock model. If not provided, reads from BEDROCK_MODEL_ID env var.
+            api_key: Cerebras API key.
+            model_name: Name of the model. If not provided, reads from CEREBRAS_MODEL_ID env var.
             temperature: Sampling temperature for LLM.
         """
         _model_name = model_name or ConfigEnv.CEREBRAS_MODEL_ID
         if not _model_name:
             raise ValueError("CEREBRAS_MODEL_ID must be set in environment variables or provided")
-        self.intent_detector = IntentDetector(api_key=api_key)
+        
         self.llm_client = LLMClient(
             api_key=api_key,
             model_name=_model_name,
             temperature=temperature,
         )
         self.tool_registry = get_registry()
+        logger.info(f"✓ ResponsePipeline initialized with model: {_model_name}")
     
     async def process_text(
         self,
         text: str,
         conversation_history: list = None,
-        session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
     ) -> Dict[str, Any]:
         """
-        Process text through the complete pipeline.
-
-        Pipeline flow:
-        1. Intent Detection
-        2. LLM Processing (with tool definitions and conversation history)
-        3. Tool Execution (if needed)
-        4. LLM Response Generation
-        5. Text Output
+        Process text through the pipeline (non-streaming).
 
         Args:
             text: Input text to process.
             conversation_history: Previous conversation for context.
-            session_id: Optional; when set, conversation and intent_log are persisted.
-            user_id: Optional; used for conversation.user_id when persisting.
+            user_id: Optional; used for tool calls requiring user identification.
             is_twilio_call: Whether this is a Twilio phone call (no GPS available).
 
         Returns:
@@ -78,61 +74,9 @@ class ResponsePipeline:
             logger.info(f"Processing text: {text[:100]}...")
             logger.info(f"Context: user_id={user_id}, is_twilio_call={is_twilio_call}")
 
-            # Build context from conversation history
-            context_prompt = text
-            if conversation_history:
-                # Format: USER: hi\nAGENT: Hello! How may I help you?\nUSER: new message
-                history_text = "\n".join(
-                    [f"{msg['role'].upper()}: {msg['text']}" for msg in conversation_history]
-                )
-                context_prompt = f"Previous conversation:\n{history_text}\n\nUSER: {text}"
-                logger.info(f"Added conversation context ({len(conversation_history)} turns)")
-
-            # Step 1: Intent Detection (skip when disabled to save one Bedrock round-trip)
-            intent_detection_enabled = ConfigEnv.INTENT_DETECTION_ENABLED
-            if intent_detection_enabled:
-                logger.info("Step 1: Intent Detection")
-                intent_result = await self.intent_detector.detect_intent(text)
-                logger.info(f"Detected intent: {intent_result.get('intent')}")
-            else:
-                logger.info("Step 1: Intent Detection skipped (INTENT_DETECTION_ENABLED=false)")
-                intent_result = {"intent": "general", "confidence": 0.0, "reasoning": "disabled"}
-
-            # Persist conversation and intent_log in background (don't block pipeline)
-            if session_id:
-                async def _persist_conversation_and_intent():
-                    try:
-                        db = get_db()
-                        now = datetime.now(timezone.utc)
-                        await db.conversations.update_one(
-                            {"session_id": session_id},
-                            {
-                                "$setOnInsert": {
-                                    "session_id": session_id,
-                                    "user_id": user_id or "unknown",
-                                    "language": "en",
-                                    "start_time": now,
-                                    "end_time": None,
-                                    "outcome": None,
-                                }
-                            },
-                            upsert=True,
-                        )
-                        await db.intent_logs.insert_one({
-                            "intent_id": str(uuid.uuid4()),
-                            "session_id": session_id,
-                            "intent_name": intent_result.get("intent", "general"),
-                            "confidence": float(intent_result.get("confidence", 0)),
-                        })
-                    except Exception as e:
-                        logger.warning(f"Failed to persist conversation/intent_log: {e}")
-                asyncio.create_task(_persist_conversation_and_intent())
-            
-            # Step 2: LLM Processing with tool definitions (filtered by intent)
-            logger.info("Step 2: LLM Processing with tools")
-            detected_intent = intent_result.get("intent", "general")
-            langchain_tools = self.tool_registry.get_langchain_tools(intent=detected_intent)
-            logger.info(f"Loaded {len(langchain_tools)} tools for intent '{detected_intent}'")
+            # Get all tools - let LLM decide which to use
+            langchain_tools = self.tool_registry.get_langchain_tools()
+            logger.info(f"Loaded {len(langchain_tools)} tools")
 
             # Build system prompt with user context and tool instructions
             system_prompt = build_system_prompt(
@@ -143,19 +87,22 @@ class ResponsePipeline:
             tool_conversation = [{"role": "system", "content": system_prompt}]
             tool_conversation.extend(conversation_history or [])
 
+            # Single LLM call - let LLM understand intent and decide on tools
+            logger.info("Calling LLM with tools...")
             llm_response = await self.llm_client.generate_with_tools(
                 prompt=text,
                 tool_schemas=langchain_tools,
                 conversation_history=tool_conversation,
             )
+            logger.info(f"LLM response received. Tool calls: {len(llm_response.get('tool_calls', []))}")
             
-            # Step 3: Tool Execution (if LLM requested tools) — run in parallel
+            # Execute tools if LLM requested any
             tool_results = []
             if llm_response.get("tool_calls"):
-                logger.info(f"Step 3: Executing {len(llm_response['tool_calls'])} tool(s) in parallel")
+                logger.info(f"Executing {len(llm_response['tool_calls'])} tool(s)...")
                 tool_calls = llm_response["tool_calls"]
 
-                async def _run_one_tool(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+                async def _run_tool(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     tool_name = tool_call.get("name")
                     tool_args = tool_call.get("arguments", {})
                     call_id = tool_call.get("call_id")
@@ -180,29 +127,23 @@ class ResponsePipeline:
                             "result": {"status": "error", "error": str(e)},
                         }
 
-                tool_results = await asyncio.gather(*[_run_one_tool(tc) for tc in tool_calls])
+                tool_results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
             
-            # Step 4: Generate final LLM response
-            logger.info("Step 4: Generating final response")
+            # Generate final response
             if tool_results:
-                # If tools were called, generate response with tool results
                 final_response = await self.llm_client.generate_final_response(
                     prompt=text,
                     tool_results=tool_results,
-                    interaction_id=llm_response.get("interaction_id"),
                     messages=llm_response.get("messages"),
                     tools=langchain_tools,
                 )
             else:
-                # If no tools were called, use the initial response
                 final_response = llm_response.get("text", "")
             
-            # Step 5: Return text output
-            logger.info("Step 5: Pipeline complete")
+            logger.info("Pipeline complete")
             
             return {
                 "response": final_response,
-                "intent": intent_result,
                 "tool_calls": [tc.get("name") for tc in llm_response.get("tool_calls", [])],
                 "tool_results": tool_results,
                 "metadata": {
@@ -213,10 +154,11 @@ class ResponsePipeline:
             
         except Exception as e:
             logger.error(f"Error in response pipeline: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 "response": f"I encountered an error processing your request: {str(e)}",
                 "error": str(e),
-                "intent": {"intent": "general", "confidence": 0.0},
                 "tool_calls": [],
                 "tool_results": [],
             }
@@ -227,7 +169,6 @@ class ResponsePipeline:
         conversation_history: list = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
-        pre_detected_intent: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Process text and stream the final LLM response.
@@ -237,66 +178,51 @@ class ResponsePipeline:
             conversation_history: Previous conversation for context.
             user_id: Optional; used for tool calls requiring user identification.
             is_twilio_call: Whether this is a Twilio phone call (no GPS available).
-            pre_detected_intent: Optional; pre-detected intent to skip redundant detection.
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
         """
         try:
             logger.info(f"Processing text (streaming): {text[:100]}...")
-            logger.info(f"[Pipeline] user_id received: {user_id}, is_twilio_call: {is_twilio_call}")
+            logger.info(f"Context: user_id={user_id}, is_twilio_call={is_twilio_call}")
 
-            # Step 1: Intent Detection (skip if already provided)
-            if pre_detected_intent:
-                logger.info("Step 1: Intent Detection (using pre-detected intent)")
-                intent_result = pre_detected_intent
-                logger.info(f"Pre-detected intent: {intent_result.get('intent')}")
-            elif ConfigEnv.INTENT_DETECTION_ENABLED:
-                logger.info("Step 1: Intent Detection")
-                intent_result = await self.intent_detector.detect_intent(text)
-                logger.info(f"Detected intent: {intent_result.get('intent')}")
-            else:
-                logger.info("Step 1: Intent Detection skipped (INTENT_DETECTION_ENABLED=false)")
-                intent_result = {"intent": "general", "confidence": 0.0, "reasoning": "disabled"}
-
-            # Step 2: LLM Processing with tool definitions (filtered by intent)
-            logger.info("Step 2: LLM Processing with tools")
-            detected_intent = intent_result.get("intent", "general")
-            langchain_tools = self.tool_registry.get_langchain_tools(intent=detected_intent)
-            logger.info(f"Loaded {len(langchain_tools)} tools for intent '{detected_intent}'")
+            # Get all tools - let LLM decide which to use
+            langchain_tools = self.tool_registry.get_langchain_tools()
+            logger.info(f"Loaded {len(langchain_tools)} tools")
 
             # Build system prompt with user context and tool instructions
-            logger.info(f"[Pipeline] Building system prompt with user_id={user_id}, is_twilio_call={is_twilio_call}")
             system_prompt = build_system_prompt(
                 user_id=user_id, 
                 tools=langchain_tools,
                 is_twilio_call=is_twilio_call,
             )
-            logger.info(f"[Pipeline] System prompt (first 500 chars): {system_prompt[:500]}...")
+            logger.info(f"System prompt built ({len(system_prompt)} chars)")
+            
             tool_conversation = [{"role": "system", "content": system_prompt}]
             tool_conversation.extend(conversation_history or [])
 
-            logger.info(f"[Pipeline] Calling LLM generate_with_tools...")
+            # Single LLM call - let LLM understand intent and decide on tools
+            logger.info("Calling LLM with tools...")
             try:
                 llm_response = await self.llm_client.generate_with_tools(
                     prompt=text,
                     tool_schemas=langchain_tools,
                     conversation_history=tool_conversation,
                 )
-                logger.info(f"[Pipeline] LLM generate_with_tools completed. Tool calls: {len(llm_response.get('tool_calls', []))}")
+                logger.info(f"LLM response received. Tool calls: {len(llm_response.get('tool_calls', []))}")
             except Exception as llm_err:
-                logger.error(f"[Pipeline] LLM generate_with_tools FAILED: {llm_err}")
+                logger.error(f"LLM call failed: {llm_err}")
                 import traceback
                 traceback.print_exc()
                 raise
 
-            # Step 3: Tool Execution (if LLM requested tools) — run in parallel
+            # Execute tools if LLM requested any
             tool_results = []
             if llm_response.get("tool_calls"):
-                logger.info(f"Step 3: Executing {len(llm_response['tool_calls'])} tool(s) in parallel")
+                logger.info(f"Executing {len(llm_response['tool_calls'])} tool(s)...")
                 tool_calls = llm_response["tool_calls"]
 
-                async def _run_one_tool_stream(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+                async def _run_tool(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     tool_name = tool_call.get("name")
                     tool_args = tool_call.get("arguments", {})
                     call_id = tool_call.get("call_id")
@@ -321,12 +247,12 @@ class ResponsePipeline:
                             "result": {"status": "error", "error": str(e)},
                         }
 
-                tool_results = await asyncio.gather(*[_run_one_tool_stream(tc) for tc in tool_calls])
+                tool_results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
 
-            # Step 4: Stream final LLM response
-            logger.info("Step 4: Streaming final response")
+            # Stream final response
+            logger.info("Streaming final response...")
             if tool_results:
-                # Need to call LLM again with tool results
+                # Stream response with tool results
                 stream = self.llm_client.stream_response(
                     prompt=text,
                     tool_results=tool_results,
@@ -334,15 +260,13 @@ class ResponsePipeline:
                     tools=langchain_tools,
                 )
             else:
-                # No tools called - use the text already generated by generate_with_tools
-                # Create a simple async generator that yields the already-generated response
+                # No tools called - yield the pre-generated response word-by-word
                 already_generated_text = llm_response.get("text", "")
-                logger.info(f"[Pipeline] No tools called, yielding pre-generated response ({len(already_generated_text)} chars)")
+                logger.info(f"No tools called, streaming pre-generated response ({len(already_generated_text)} chars)")
                 
                 async def yield_existing_response():
                     """Yield the already-generated response as a stream"""
                     if already_generated_text:
-                        # Yield in word chunks for streaming effect
                         words = already_generated_text.split(' ')
                         for i, word in enumerate(words):
                             if i > 0:
@@ -354,7 +278,6 @@ class ResponsePipeline:
 
             return {
                 "stream": stream,
-                "intent": intent_result,
                 "tool_calls": [tc.get("name") for tc in llm_response.get("tool_calls", [])],
                 "tool_results": tool_results,
                 "metadata": {
@@ -365,11 +288,12 @@ class ResponsePipeline:
 
         except Exception as e:
             logger.error(f"Error in streaming response pipeline: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 "stream": None,
                 "response": f"I encountered an error processing your request: {str(e)}",
                 "error": str(e),
-                "intent": {"intent": "general", "confidence": 0.0},
                 "tool_calls": [],
                 "tool_results": [],
             }

@@ -425,37 +425,13 @@ async def audio_websocket(ws: WebSocket):
             print(f"🔐 process_and_respond: user_id = {user_id}")
             print(f"📄 Processing transcript: {full_transcript}")
             
-            # Step 1: Detect intent FIRST (fast operation)
-            print("🔍 Detecting intent...")
-            intent_result = await llm_service.detect_intent(full_transcript)
-            detected_intent = intent_result.get("intent", "general")
-            requires_tools = intent_result.get("requires_tools", False)
-            print(f"🎯 Intent: {detected_intent} (requires_tools: {requires_tools})")
-            
-            # Step 2: Play wait audio if intent requires tools (causes delay)
-            if requires_tools:
-                print("⏳ Playing wait audio - tool processing expected...")
-                try:
-                    await ws.send_json({"type": "audio_start", "reason": "tool_processing"})
-                    for chunk in get_wait_float32_44100_chunks(chunk_size=4096):
-                        await ws.send_bytes(chunk)
-                    await ws.send_json({"type": "audio_end", "reason": "tool_processing"})
-                    print("✅ Wait audio played successfully")
-                except Exception as wait_err:
-                    print(f"⚠️ Failed to play wait audio: {wait_err}")
-            else:
-                print("⏩ Skipping wait audio - intent doesn't require tools")
-            
-            # Note: User message was already added to conversation_history in finalize_utterance()
-            
-            # Step 3: Process with LLM pipeline (streaming)
+            # Process with LLM pipeline (streaming) - single LLM call handles everything
             print(f"🤖 Calling LLM service (streaming) with conversation context ({len(conversation_history)} turns)...")
             print(f"🔑 user_id being passed to LLM: {user_id}")
             llm_result = await llm_service.process_stream(
                 full_transcript,
                 conversation_history,
                 user_id=user_id,
-                pre_detected_intent=intent_result,  # Pass pre-detected intent to avoid redundant detection
             )
 
             stream = llm_result.get("stream")
@@ -504,7 +480,6 @@ async def audio_websocket(ws: WebSocket):
             await ws.send_json(serialize_for_json({
                 "type": "llm_start",
                 "transcript": full_transcript,
-                "intent": llm_result.get("intent", {}),
                 "tool_calls": tool_names,
                 "tool_results": llm_result.get("tool_results", []),
                 "conversation_history": conversation_history[-10:],
@@ -533,6 +508,7 @@ async def audio_websocket(ws: WebSocket):
             # Text buffer for TTS - accumulates tokens to form sentences/phrases
             # preventing tiny audio chunks and stuttering
             tts_text_buffer = ""
+            tts_queue = []  # Queue to hold TTS chunks for processing after LLM stream
             MIN_TTS_CHUNK_SIZE = 20  # Lowered for faster time-to-first-audio (real-time feel)
 
             if stream:
@@ -597,50 +573,79 @@ async def audio_websocket(ws: WebSocket):
                                 await ws.send_json({"type": "audio_start"})
                                 tts_started = True
 
-                            try:
-                                tts_language = normalize_tts_language(detected_language)
-                                # Only log reasonably sized chunks to avoid spam
-                                if len(text_to_speak) > 10:
-                                    print(f"🔊 TTS streaming chunk ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
-                                
-                                # Buffer for audio output to avoid tiny websocket frames
-                                audio_output_buffer = bytearray()
-                                MIN_AUDIO_FRAME_SIZE = 4096  # ~4KB chunks (approx 23ms) for lower latency
+                            # Queue TTS work to be processed after LLM stream completes
+                            # This allows LLM to continue streaming without being blocked by TTS
+                            tts_queue.append({
+                                "text": text_to_speak,
+                                "is_last": is_last,
+                            })
 
-                                async for audio_chunk in tts_service.stream_tts_chunk(
-                                    transcript=text_to_speak,
-                                    context_id=tts_context_id,
-                                    continue_flag=not is_last,
-                                    language=tts_language,
-                                ):
-                                    # Check for user interruption during TTS
-                                    if user_is_speaking:
-                                        print("⚠️  User speaking during TTS - interrupting")
-                                        await ws.send_json({"type": "interrupted"})
-                                        return
-                                    
-                                    current_task = asyncio.current_task()
-                                    if current_task and current_task.cancelled():
-                                        print("⚠️  TTS streaming interrupted")
-                                        await ws.send_json({"type": "interrupted"})
-                                        return
+                # After LLM stream completes, process TTS queue
+                if tts_service.enabled and tts_queue:
+                    tts_language = normalize_tts_language(detected_language)
+                    print(f"🔊 Processing {len(tts_queue)} TTS chunks...")
+                    
+                    for i, tts_item in enumerate(tts_queue):
+                        text_to_speak = tts_item["text"]
+                        is_last_tts = (i == len(tts_queue) - 1)
+                        
+                        # Check for interruption
+                        if user_is_speaking:
+                            print("⚠️  User speaking during TTS - interrupting")
+                            await ws.send_json({"type": "interrupted"})
+                            return
+                        
+                        current_task = asyncio.current_task()
+                        if current_task and current_task.cancelled():
+                            print("⚠️  TTS streaming interrupted")
+                            await ws.send_json({"type": "interrupted"})
+                            return
+                        
+                        try:
+                            if len(text_to_speak) > 10:
+                                print(f"🔊 TTS chunk {i+1}/{len(tts_queue)} ({len(text_to_speak)} chars): {text_to_speak[:30]}...")
+                            
+                            # Buffer for audio output to avoid tiny websocket frames
+                            audio_output_buffer = bytearray()
+                            MIN_AUDIO_FRAME_SIZE = 4096  # ~4KB chunks (approx 23ms) for lower latency
+                            
+                            print(f"🔊 Starting TTS stream for chunk {i+1}...")
 
-                                    audio_output_buffer.extend(audio_chunk)
-                                    
-                                    if len(audio_output_buffer) >= MIN_AUDIO_FRAME_SIZE:
-                                        await ws.send_bytes(audio_output_buffer)
-                                        audio_chunk_count += 1
-                                        audio_output_buffer = bytearray()
+                            async for audio_chunk in tts_service.stream_tts_chunk(
+                                transcript=text_to_speak,
+                                context_id=tts_context_id,
+                                continue_flag=not is_last_tts,
+                                language=tts_language,
+                            ):
+                                print(f"🔊 Received audio chunk: {len(audio_chunk)} bytes")
+                                # Check for user interruption during TTS
+                                if user_is_speaking:
+                                    print("⚠️  User speaking during TTS - interrupting")
+                                    await ws.send_json({"type": "interrupted"})
+                                    return
                                 
-                                # Flush remaining audio
-                                if len(audio_output_buffer) > 0:
+                                current_task = asyncio.current_task()
+                                if current_task and current_task.cancelled():
+                                    print("⚠️  TTS streaming interrupted")
+                                    await ws.send_json({"type": "interrupted"})
+                                    return
+
+                                audio_output_buffer.extend(audio_chunk)
+                                
+                                if len(audio_output_buffer) >= MIN_AUDIO_FRAME_SIZE:
                                     await ws.send_bytes(audio_output_buffer)
                                     audio_chunk_count += 1
-                                    
-                            except asyncio.CancelledError:
-                                print("⚠️  TTS streaming cancelled by interruption")
-                                await ws.send_json({"type": "interrupted"})
-                                raise
+                                    audio_output_buffer = bytearray()
+                            
+                            # Flush remaining audio
+                            if len(audio_output_buffer) > 0:
+                                await ws.send_bytes(audio_output_buffer)
+                                audio_chunk_count += 1
+                                
+                        except asyncio.CancelledError:
+                            print("⚠️  TTS streaming cancelled by interruption")
+                            await ws.send_json({"type": "interrupted"})
+                            raise
 
                 if tts_started:
                     await ws.send_json({"type": "audio_end"})
@@ -670,7 +675,6 @@ async def audio_websocket(ws: WebSocket):
                 "type": "llm_response",
                 "transcript": full_transcript,
                 "response": response_text,
-                "intent": llm_result.get("intent", {}),
                 "tool_calls": tool_names,
                 "tool_results": llm_result.get("tool_results", []),
                 "conversation_history": conversation_history[-10:]

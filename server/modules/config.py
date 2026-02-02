@@ -76,24 +76,15 @@ class ConfigEnv:
     SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")  # Legacy, kept for reference
     ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 
-    # ----- Feature flags -----
-    _ide = (os.getenv("INTENT_DETECTION_ENABLED", "true") or "").strip().lower()
-    INTENT_DETECTION_ENABLED = _ide not in {"0", "false", "no", "off"}
+    # ----- Sarvam TTS -----
+    SARVAM_TTS_ENABLED = convert_to_bool(os.getenv("SARVAM_TTS_ENABLED", "true"))
+    SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "anushka")  # Default speaker
 
     REQUIRED = [
         # "GEMINI_API_KEY",
         "TWILIO_ACCOUNT_SID",
         "TWILIO_AUTH_TOKEN",
         "MONGODB_URL",
-        "CARTESIA_API_KEY",
-        "CARTESIA_TTS_ENABLED",
-        "CARTESIA_MODEL_ID",
-        "CARTESIA_TEMPERATURE",
-        "CARTESIA_MAX_TOKENS",
-        "CARTESIA_LANGUAGE",
-        "CARTESIA_VOICE",
-        "CARTESIA_VOICE_SPEED",
-        "CARTESIA_VOICE_PITCH",
     ]
 
     @classmethod
