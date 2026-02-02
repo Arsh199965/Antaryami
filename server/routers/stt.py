@@ -536,7 +536,10 @@ async def audio_websocket(ws: WebSocket):
             MIN_TTS_CHUNK_SIZE = 20  # Lowered for faster time-to-first-audio (real-time feel)
 
             if stream:
+                print(f"📡 Starting LLM response stream...")
+                chunk_count = 0
                 async for text_chunk, is_last in stream_with_last(stream):
+                    chunk_count += 1
                     # Check for interruption (user speaking or task cancelled)
                     current_task = asyncio.current_task()
                     if current_task and current_task.cancelled():
@@ -551,10 +554,15 @@ async def audio_websocket(ws: WebSocket):
                         return
 
                     response_text += text_chunk
+                    # Send streaming update to frontend
                     await ws.send_json({
                         "type": "response_stream",
                         "text": response_text.strip()
                     })
+                    
+                    # Log first few chunks for debugging
+                    if chunk_count <= 3:
+                        print(f"📡 Stream chunk {chunk_count}: '{text_chunk[:50]}...' (total: {len(response_text)} chars)")
 
                     if tts_service.enabled:
                         tts_text_buffer += text_chunk
@@ -637,6 +645,19 @@ async def audio_websocket(ws: WebSocket):
                 if tts_started:
                     await ws.send_json({"type": "audio_end"})
                     print(f"✅ TTS streaming complete ({audio_chunk_count} chunks)\n")
+                    
+                print(f"📡 Stream completed: {chunk_count} chunks, {len(response_text)} chars total")
+            else:
+                # Fallback: No stream available, use pre-generated response if any
+                print("⚠️  No stream available from LLM")
+                fallback_response = llm_result.get("response", "")
+                if fallback_response:
+                    response_text = fallback_response
+                    print(f"📄 Using fallback response: {response_text[:100]}...")
+                    await ws.send_json({
+                        "type": "response_stream",
+                        "text": response_text.strip()
+                    })
 
             # Add assistant response to conversation history
             conversation_history.append({

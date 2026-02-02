@@ -445,6 +445,7 @@ export function useVoiceBot(options: UseVoiceBotOptions = {}): UseVoiceBotReturn
               setTranscript(data.text || '');
             } else if (data.type === 'response_stream') {
               // Streaming response text word-by-word
+              console.log('📡 Streaming response:', data.text?.substring(0, 50) + '...');
               setStreamingResponse(data.text || '');
             } else if (data.type === 'llm_response') {
               console.log('📄 Transcript:', data.transcript);
