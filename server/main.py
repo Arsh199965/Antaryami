@@ -11,7 +11,12 @@ from modules.config import ConfigEnv
 from routers.stt import router as stt_router
 from routers.text import router as text_router
 from routers.tts import router as tts_router
-from routers.twilio import router as twilio_router
+# Use optimized Twilio router by default (set USE_OPTIMIZED_TWILIO=false to disable)
+USE_OPTIMIZED_TWILIO = os.getenv("USE_OPTIMIZED_TWILIO", "true").lower() == "true"
+if USE_OPTIMIZED_TWILIO:
+    from routers.twilio_optimized import router as twilio_router
+else:
+    from routers.twilio import router as twilio_router
 from routers.batteries import router as batteries_router
 from routers.auth import router as auth_router
 from routers.user import router as user_router
@@ -20,6 +25,7 @@ from routers.location import router as location_router
 from routers.agent import router as agent_router
 from db.connection import get_db, close_client
 from db.indexes import create_indexes
+from services.tts import get_tts_pool
 
 # Configure logging
 logging.basicConfig(
@@ -37,6 +43,12 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events.
     """
     logger.info("Starting up BatterySmart API...")
+    
+    # Log optimization status
+    if USE_OPTIMIZED_TWILIO:
+        logger.info("✓ Using OPTIMIZED Twilio router (sentence-level streaming, async STT, connection pooling)")
+    else:
+        logger.info("⚠️ Using standard Twilio router (set USE_OPTIMIZED_TWILIO=true for optimizations)")
         
     # Verify API keys
     # gemini_model_name = ConfigEnv.GEMINI_MODEL_NAME
@@ -52,12 +64,31 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     await create_indexes(db)
     logger.info("✓ MongoDB connected")
+    
+    # Initialize TTS connection pool (Problem 6 fix)
+    if USE_OPTIMIZED_TWILIO:
+        try:
+            tts_pool = get_tts_pool()
+            await tts_pool.initialize()
+            logger.info("✓ TTS connection pool initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ TTS pool initialization failed: {e}")
 
     logger.info("✓ Startup complete")
 
     yield  # Application runs here
 
     logger.info("Shutting down BatterySmart API...")
+    
+    # Shutdown TTS pool
+    if USE_OPTIMIZED_TWILIO:
+        try:
+            tts_pool = get_tts_pool()
+            await tts_pool.shutdown()
+            logger.info("✓ TTS connection pool shut down")
+        except Exception as e:
+            logger.warning(f"⚠️ TTS pool shutdown error: {e}")
+    
     close_client()
     logger.info("✓ Shutdown complete")
 

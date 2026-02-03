@@ -10,6 +10,7 @@ from modules.config import ConfigEnv
 from .llm_client import LLMClient
 from .tool_registry import get_registry
 from .prompts import build_system_prompt
+from .prompts_fast import build_fast_system_prompt, get_filler_response
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,7 @@ class ResponsePipeline:
         conversation_history: list = None,
         user_id: Optional[str] = None,
         is_twilio_call: bool = False,
+        fast_mode: bool = True,
     ) -> Dict[str, Any]:
         """
         Process text and stream the final LLM response.
@@ -177,29 +179,39 @@ class ResponsePipeline:
             text: Input text to process.
             conversation_history: Previous conversation for context.
             user_id: Optional; used for tool calls requiring user identification.
-            is_twilio_call: Whether this is a Twilio phone call (no GPS available).
+            is_twilio_call: Whether this is a Twilio phone call.
+            fast_mode: Use optimized shorter prompts for faster inference (default: True).
 
         Returns:
             Dictionary containing metadata and an async generator under "stream".
         """
         try:
             logger.info(f"Processing text (streaming): {text[:100]}...")
-            logger.info(f"Context: user_id={user_id}, is_twilio_call={is_twilio_call}")
+            logger.info(f"Context: user_id={user_id}, is_twilio_call={is_twilio_call}, fast_mode={fast_mode}")
 
             # Get all tools - let LLM decide which to use
             langchain_tools = self.tool_registry.get_langchain_tools()
             logger.info(f"Loaded {len(langchain_tools)} tools")
 
-            # Build system prompt with user context and tool instructions
-            system_prompt = build_system_prompt(
-                user_id=user_id, 
-                tools=langchain_tools,
-                is_twilio_call=is_twilio_call,
-            )
-            logger.info(f"System prompt built ({len(system_prompt)} chars)")
+            # Build system prompt - use fast mode for lower latency
+            if fast_mode:
+                system_prompt = build_fast_system_prompt(
+                    user_id=user_id,
+                    tools=langchain_tools,
+                    is_twilio_call=is_twilio_call,
+                )
+            else:
+                system_prompt = build_system_prompt(
+                    user_id=user_id, 
+                    tools=langchain_tools,
+                    is_twilio_call=is_twilio_call,
+                )
+            logger.info(f"System prompt built ({len(system_prompt)} chars, fast_mode={fast_mode})")
             
+            # Limit conversation history to reduce prompt size (keep last 6 turns max)
+            limited_history = (conversation_history or [])[-6:]
             tool_conversation = [{"role": "system", "content": system_prompt}]
-            tool_conversation.extend(conversation_history or [])
+            tool_conversation.extend(limited_history)
 
             # Single LLM call - let LLM understand intent and decide on tools
             logger.info("Calling LLM with tools...")
@@ -276,10 +288,14 @@ class ResponsePipeline:
                     
                 stream = yield_existing_response()
 
+            # Include filler for caller to play while waiting (if tools were used)
+            filler = get_filler_response("hi") if tool_results else None
+
             return {
                 "stream": stream,
                 "tool_calls": [tc.get("name") for tc in llm_response.get("tool_calls", [])],
                 "tool_results": tool_results,
+                "filler": filler,  # Caller can play this while tools executed
                 "metadata": {
                     "model": self.llm_client.model_name,
                     "temperature": self.llm_client.temperature,
