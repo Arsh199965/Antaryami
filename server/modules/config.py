@@ -78,7 +78,7 @@ class ConfigEnv:
 
     # ----- Sarvam TTS -----
     SARVAM_TTS_ENABLED = convert_to_bool(os.getenv("SARVAM_TTS_ENABLED", "true"))
-    SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "anushka")  # Default speaker
+    SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "shubh")  # Default speaker (bulbul:v3)
 
     REQUIRED = [
         # "GEMINI_API_KEY",

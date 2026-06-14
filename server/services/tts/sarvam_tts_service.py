@@ -1,6 +1,6 @@
 """
 TTS Service - Sarvam AI Streaming Text-to-Speech
-Uses Sarvam's bulbul:v2 model for high-quality Hindi/English TTS.
+Uses Sarvam's bulbul:v3 model for high-quality Hindi/English TTS.
 
 Optimized for low latency with:
 - WAV output format (reliable with SDK)
@@ -23,15 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 # Sarvam TTS configuration
-SARVAM_TTS_MODEL = "bulbul:v2"
+SARVAM_TTS_MODEL = "bulbul:v3"
 
 # Output format optimizations for low latency:
 # - Use WAV format (PCM codec has SDK issues - returns no data)
 # - WAV is uncompressed PCM with 44-byte header, fast to process
-# - 22050Hz is Sarvam's native rate, avoids server-side resampling
-# - Upsample 2x to 44100Hz client-side (simple and fast)
+# - 24000Hz is Sarvam's native rate for v3, avoids server-side resampling
+# - Upsample to 44100Hz client-side
 OUTPUT_AUDIO_CODEC = "wav"  # WAV works reliably; PCM has SDK issues
-SARVAM_SAMPLE_RATE = 22050  # Sarvam's native rate - no server resampling
+SARVAM_SAMPLE_RATE = 24000  # Sarvam v3 native rate
 CLIENT_SAMPLE_RATE = 44100  # Client expects 44100Hz
 
 # Buffer settings for low latency
@@ -40,18 +40,21 @@ CLIENT_SAMPLE_RATE = 44100  # Client expects 44100Hz
 MIN_BUFFER_SIZE = 30  # Minimum allowed by API (30-200 range)
 MAX_CHUNK_LENGTH = 100  # Smaller chunks for faster streaming
 
-# Available speakers for Sarvam TTS
+# Available speakers for Sarvam TTS (bulbul:v3)
+# v3 has a wider catalog: aditya, ritu, priya, neha, rahul, pooja, rohan, simran,
+# kavya, amit, dev, ishita, shreya, ratan, varun, manan, sumit, roopa, kabir,
+# aayan, shubh, ashutosh, advait, amelia, sophia
 SARVAM_SPEAKERS = {
-    "hi": "anushka",    # Default Hindi voice
-    "en": "meera",      # Default English voice (also supports Hindi)
+    "hi": "shubh",    # Default Hindi voice
+    "en": "shubh",    # Default English voice (works across all v3 languages)
 }
 
 
 class SarvamTTSService:
-    """Service for handling TTS operations with Sarvam AI.
+    """Service for handling TTS operations with Sarvam AI (bulbul:v3).
     
     Optimized for low latency streaming with:
-    - PCM output (no codec decoding)
+    - WAV output with Float32 conversion
     - Small buffer sizes for fast first audio
     - Connection reuse for chunk streaming
     """
@@ -90,15 +93,15 @@ class SarvamTTSService:
     
     def _pcm_int16_to_float32(self, pcm_data: bytes) -> bytes:
         """
-        Convert PCM int16 audio to Float32 format with 2x upsampling.
+        Convert PCM int16 audio to Float32 format with resampling.
         PCM LINEAR16 is raw int16 samples without any header.
-        Upsamples from 22050Hz to 44100Hz using NumPy vectorized operations.
+        Resamples from SARVAM_SAMPLE_RATE to CLIENT_SAMPLE_RATE using linear interpolation.
         
         Args:
             pcm_data: Raw PCM int16 audio bytes (little-endian)
             
         Returns:
-            Float32 little-endian audio bytes at 44100Hz
+            Float32 little-endian audio bytes at CLIENT_SAMPLE_RATE
         """
         if len(pcm_data) < 2:
             return b''
@@ -109,24 +112,19 @@ class SarvamTTSService:
         # Convert to float32 and normalize to -1.0 to 1.0 range
         float32_samples = int16_samples.astype(np.float32) / 32768.0
         
-        # Upsample 2x from 22050Hz to 44100Hz using linear interpolation
-        # Create interpolated samples (midpoints between consecutive samples)
-        # Shift array and compute midpoints: (samples[i] + samples[i+1]) / 2
-        midpoints = (float32_samples[:-1] + float32_samples[1:]) * 0.5
-        # Add last sample's midpoint (duplicate last sample)
-        midpoints = np.append(midpoints, float32_samples[-1])
-        
-        # Interleave original samples with midpoints
-        resampled = np.empty(len(float32_samples) * 2, dtype=np.float32)
-        resampled[0::2] = float32_samples  # Original samples at even indices
-        resampled[1::2] = midpoints  # Midpoints at odd indices
+        # Resample from SARVAM_SAMPLE_RATE to CLIENT_SAMPLE_RATE
+        src_len = len(float32_samples)
+        dst_len = int(src_len * CLIENT_SAMPLE_RATE / SARVAM_SAMPLE_RATE)
+        x_src = np.arange(src_len)
+        x_dst = np.linspace(0, src_len - 1, dst_len)
+        resampled = np.interp(x_dst, x_src, float32_samples)
         
         # Return as bytes (already little-endian on most systems)
-        return resampled.tobytes()
+        return resampled.astype(np.float32).tobytes()
     
     def _wav_to_float32(self, wav_data: bytes, is_first_chunk: bool = True) -> bytes:
         """
-        Convert WAV audio to Float32 format with 2x upsampling.
+        Convert WAV audio to Float32 format with resampling.
         WAV contains a 44-byte header followed by PCM int16 data.
         
         Args:
@@ -134,7 +132,7 @@ class SarvamTTSService:
             is_first_chunk: If True, skip the 44-byte WAV header
             
         Returns:
-            Float32 little-endian audio bytes at 44100Hz
+            Float32 little-endian audio bytes at CLIENT_SAMPLE_RATE
         """
         if len(wav_data) < 4:
             return b''
@@ -187,8 +185,8 @@ class SarvamTTSService:
                 # Configure with low-latency optimizations:
                 # - min_buffer_size: Low value for fast first audio (30 is minimum)
                 # - max_chunk_length: Smaller for more frequent audio chunks
-                # - PCM output: No codec decoding overhead
-                # - Using Sarvam's native 22050Hz, will upsample to 44100Hz client-side
+                # - WAV output: reliable format
+                # - Using Sarvam v3's native 24000Hz, will upsample to 44100Hz client-side
                 await ws.configure(
                     target_language_code=lang_code,
                     speaker=speaker,

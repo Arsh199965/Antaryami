@@ -23,9 +23,9 @@ from services.tts import utils
 logger = logging.getLogger(__name__)
 
 # Configuration
-SARVAM_TTS_MODEL = "bulbul:v2"
+SARVAM_TTS_MODEL = "bulbul:v3"
 OUTPUT_AUDIO_CODEC = "wav"
-SARVAM_SAMPLE_RATE = 22050
+SARVAM_SAMPLE_RATE = 24000
 CLIENT_SAMPLE_RATE = 44100
 MIN_BUFFER_SIZE = 30
 MAX_CHUNK_LENGTH = 100
@@ -38,10 +38,10 @@ IDLE_TIMEOUT = timedelta(seconds=30)  # Time before returning to pool
 # Type alias for language
 TTSLanguage = Literal["hi", "en"]
 
-# Available speakers
+# Available speakers (bulbul:v3)
 SARVAM_SPEAKERS = {
-    "hi": "anushka",
-    "en": "meera",
+    "hi": "shubh",
+    "en": "shubh",
 }
 
 
@@ -226,7 +226,7 @@ class PooledTTSService:
         return "hi-IN" if language == "hi" else "en-IN"
     
     def _wav_to_float32(self, wav_data: bytes, is_first_chunk: bool = True) -> bytes:
-        """Convert WAV audio to Float32 format with 2x upsampling."""
+        """Convert WAV audio to Float32 format with resampling."""
         if len(wav_data) < 4:
             return b''
         
@@ -238,14 +238,14 @@ class PooledTTSService:
         int16_samples = np.frombuffer(pcm_data, dtype=np.int16)
         float32_samples = int16_samples.astype(np.float32) / 32768.0
         
-        midpoints = (float32_samples[:-1] + float32_samples[1:]) * 0.5
-        midpoints = np.append(midpoints, float32_samples[-1])
+        # Resample from SARVAM_SAMPLE_RATE to CLIENT_SAMPLE_RATE
+        src_len = len(float32_samples)
+        dst_len = int(src_len * CLIENT_SAMPLE_RATE / SARVAM_SAMPLE_RATE)
+        x_src = np.arange(src_len)
+        x_dst = np.linspace(0, src_len - 1, dst_len)
+        resampled = np.interp(x_dst, x_src, float32_samples)
         
-        resampled = np.empty(len(float32_samples) * 2, dtype=np.float32)
-        resampled[0::2] = float32_samples
-        resampled[1::2] = midpoints
-        
-        return resampled.tobytes()
+        return resampled.astype(np.float32).tobytes()
     
     async def stream_tts(
         self,
@@ -290,7 +290,7 @@ class PooledTTSService:
         
         try:
             async with conn.client.text_to_speech_streaming.connect(
-                model="bulbul:v2",
+                model=self.model,
                 send_completion_event=True
             ) as ws:
                 await ws.configure(
